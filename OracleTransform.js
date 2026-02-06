@@ -149,7 +149,13 @@ function transformConstraint(constraint, field, count = false) {
           );
         }
 
-        answer[key] = DateCoder.DatabaseToJSON(transformer(val));
+        const transformedValue = transformer(val);
+        // Only apply DateCoder.DatabaseToJSON for Date fields, not for other types like Pointers
+        if (field && field.type === 'Date') {
+          answer[key] = DateCoder.DatabaseToJSON(transformedValue);
+        } else {
+          answer[key] = transformedValue;
+        }
         break;
       }
 

@@ -926,7 +926,6 @@ export class OracleStorageAdapter implements StorageAdapter {
             path: fieldName,
           },
         ],
-        unique: true,
       };
       const collection = this._adaptiveCollection(className);
       const result = await collection._createIndex(indexRequest);
@@ -1145,7 +1144,6 @@ export class OracleStorageAdapter implements StorageAdapter {
         const indexRequest = {
           name: idxName,
           fields: this.createIndexPaths(paths),
-          unique: true,
         };
         const promise = await collection._createIndex(indexRequest);
         promises.push(promise);
