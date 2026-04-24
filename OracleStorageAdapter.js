@@ -1056,7 +1056,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         schema.fields[fieldName] && schema.fields[fieldName].type === 'Pointer';
       const transformField = transformKey(className, fieldName, schema);
       const collection = this._adaptiveCollection(className);
-      let objects = collection.distinct(transformField, transformWhere(className, query, schema));
+      let objects = await collection.distinct(transformField, transformWhere(className, query, schema));
       objects = objects.filter(obj => obj != null);
       logger.verbose('StorageAdapter distinct returns ' + objects);
       return objects.map(object => {
