@@ -362,7 +362,14 @@ export default class OracleCollection {
             });
             updateObj = oldContent;
           } else {
-            updateObj = _.merge(oldContent, update);
+            // Use mergeWith with an array customizer so that arrays in `update`
+            // fully replace arrays in `oldContent`. Plain `_.merge` merges
+            // arrays by index, which silently preserves trailing elements when
+            // the new array is shorter — corrupting any field whose update
+            // shrinks an array (e.g. participantsIds when removing a user).
+            updateObj = _.mergeWith(oldContent, update, (objVal, srcVal) =>
+              Array.isArray(srcVal) ? srcVal : undefined
+            );
           }
         }
         logger.verbose('Updated Object = ' + JSON.stringify(updateObj));
@@ -1411,7 +1418,13 @@ export default class OracleCollection {
             });
             updateObj = oldContent;
           } else {
-            updateObj = _.merge(oldContent, currentUpdate);
+            // See findOneAndUpdate above: array values in `currentUpdate`
+            // must fully replace arrays in `oldContent` rather than merge
+            // by index, otherwise shrinking arrays silently retain their
+            // trailing elements.
+            updateObj = _.mergeWith(oldContent, currentUpdate, (objVal, srcVal) =>
+              Array.isArray(srcVal) ? srcVal : undefined
+            );
           }
         }
 
