@@ -18,6 +18,17 @@ BEGIN
     ');
 END;`;
 
+const isOraTableMissingError = error => {
+  if (!error) {
+    return false;
+  }
+  if (typeof error === 'string') {
+    return error.includes('ORA-00942');
+  }
+  const message = error?.message;
+  return error?.errorNum === 942 || (message && message.includes('ORA-00942'));
+};
+
 export default class OracleCollection {
   _oracleSodaDB: SodaDB;
   _oracleCollection: Collection;
@@ -26,6 +37,8 @@ export default class OracleCollection {
   indexes = new Array();
   idIndexCreating = false;
   jsonSQLtype = 'JSON'; //DBVersion 23c default
+  _tableVerified = false;
+  _tableRepairPromise = null;
 
   constructor(oracleStorageAdapter: OracleStorageAdapter, collectionName: String) {
     this._oracleStorageAdapter = oracleStorageAdapter;
@@ -38,14 +51,137 @@ export default class OracleCollection {
     }
   }
 
-  async getCollectionConnection() {
-    const mymetadata = {
+  _getCollectionMetadata() {
+    return {
       keyColumn: { name: 'ID', assignmentMethod: 'UUID' },
       contentColumn: { name: 'JSON_DOCUMENT', sqlType: this.jsonSQLtype },
       versionColumn: { name: 'VERSION', method: 'UUID' },
       lastModifiedColumn: { name: 'LAST_MODIFIED' },
       creationTimeColumn: { name: 'CREATED_ON' },
     };
+  }
+
+  async _getCollectionTableName(collection: any): Promise<string> {
+    if (!collection?.getMetadata) {
+      return this._name;
+    }
+    try {
+      const metadata = await collection.getMetadata();
+      const metaObj = typeof metadata === 'string' ? JSON.parse(metadata) : metadata;
+      return metaObj?.tableName || metaObj?.table_name || this._name;
+    } catch (error) {
+      logger.warn('getCollectionConnection failed to read SODA metadata for ' + this._name + ': ' + error);
+      return this._name;
+    }
+  }
+
+  async _checkTableExists(localConn: any, tableName: string): Promise<?boolean> {
+    if (!localConn?.execute) {
+      return undefined;
+    }
+    try {
+      const result = await localConn.execute(
+        'SELECT 1 FROM user_tables WHERE upper(table_name) = upper(:table_name)',
+        { table_name: tableName },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const rows = result?.rows || [];
+      return rows.length > 0;
+    } catch (error) {
+      logger.warn(
+        'getCollectionConnection failed to verify table for ' + this._name + ': ' + error
+      );
+      return undefined;
+    }
+  }
+
+  async _repairMissingTable(collection: any, tableName: string): Promise<?Collection> {
+    if (this._tableRepairPromise) {
+      return this._tableRepairPromise;
+    }
+    this._tableRepairPromise = (async () => {
+      logger.warn(
+        'SODA table missing for collection ' +
+          this._name +
+          ' (table=' +
+          tableName +
+          '). Recreating collection.'
+      );
+      try {
+        if (collection?.drop) {
+          await collection.drop();
+        }
+      } catch (error) {
+        if (!isOraTableMissingError(error)) {
+          logger.warn('SODA drop failed for ' + this._name + ': ' + error);
+        }
+      }
+      try {
+        const createOptions = { metaData: this._getCollectionMetadata() };
+        const replaceMode =
+          oracledb?.SODA_COLL_CREATE_MODE_REPLACE ||
+          oracledb?.SODA_COLL_CREATE_MODE_DROP ||
+          oracledb?.SODA_COLL_CREATE_MODE_TRUNCATE;
+        if (replaceMode) {
+          createOptions.createMode = replaceMode;
+        }
+        const newCollection = await this._oracleSodaDB.createCollection(this._name, createOptions);
+        if (newCollection) {
+          await this._ensureIdIndex(newCollection);
+          this._oracleCollection = newCollection;
+          this._tableVerified = true;
+        }
+        return newCollection;
+      } catch (error) {
+        logger.error('SODA collection recreate failed for ' + this._name + ': ' + error);
+        throw error;
+      }
+    })();
+
+    try {
+      return await this._tableRepairPromise;
+    } finally {
+      this._tableRepairPromise = null;
+    }
+  }
+
+  async _ensureCollectionTable(collection: any, localConn: any): Promise<any> {
+    if (this._tableVerified) {
+      return collection;
+    }
+    const tableName = await this._getCollectionTableName(collection);
+    const exists = await this._checkTableExists(localConn, tableName);
+    if (exists === true) {
+      this._tableVerified = true;
+      return collection;
+    }
+    if (exists === false) {
+      const repaired = await this._repairMissingTable(collection, tableName);
+      return repaired || collection;
+    }
+    return collection;
+  }
+
+  async _ensureIdIndex(collection: any) {
+    if (this.idIndexCreating) {
+      return;
+    }
+    this.idIndexCreating = true;
+    const indexName = 'ididx' + this._name;
+    const indexSpec = { name: indexName, unique: true, fields: [{ path: '_id' }] };
+    await collection.createIndex(indexSpec);
+    logger.verbose('getCollectionConnection successfully create _id index for  ' + this._name);
+    // Add _id if it doesn't exist to indexes array
+    const found = this.indexes.find(item => {
+      return Object.keys(item)[0] === '_id_';
+    });
+    if (typeof found === 'undefined') {
+      this.indexes.push({ _id_: { _id: 1 } });
+    }
+  }
+
+  async getCollectionConnection() {
+    const mymetadata = this._getCollectionMetadata();
 
     logger.verbose('getCollectionConnection about to connect for collection ' + this._name);
     let localConn;
@@ -80,25 +216,10 @@ export default class OracleCollection {
             Index names MUST be unique in a schema, append table name
             cannot have two indexes with the same name in a single schema.
           */
-          if (!this.idIndexCreating) {
-            this.idIndexCreating = true;
-            const indexName = 'ididx' + this._name;
-            const indexSpec = { name: indexName, unique: true, fields: [{ path: '_id' }] };
-            await newCollection.createIndex(indexSpec);
-            logger.verbose(
-              'getCollectionConnection successfully create _id index for  ' + this._name
-            );
-            // Add _id if it doesn't exist to indexes array
-            const found = this.indexes.find(item => {
-              return Object.keys(item)[0] === '_id_';
-            });
-            if (typeof found === 'undefined') {
-              this.indexes.push({ _id_: { _id: 1 } });
-            }
-          }
+          await this._ensureIdIndex(newCollection);
           return newCollection;
         }
-        return coll;
+        return this._ensureCollectionTable(coll, localConn);
       })
       .catch(error => {
         logger.error('getCollectionConnection ERROR:  ' + error);
@@ -830,7 +951,8 @@ export default class OracleCollection {
       caseInsensitive,
       explain,
       sortTypes,
-    } = {}
+    } = {},
+    retrying = false
   ) {
     logger.verbose('_rawFind: collection = ' + JSON.stringify(this._oracleCollection));
     logger.verbose('query = ' + JSON.stringify(query));
@@ -844,6 +966,18 @@ export default class OracleCollection {
       explain
     );
 
+    const retryOptions = {
+      skip,
+      limit,
+      sort,
+      keys,
+      maxTimeMS,
+      readPreference,
+      hint,
+      caseInsensitive,
+      explain,
+      sortTypes,
+    };
     let localConn = null;
     try {
       let findOperation;
@@ -1167,6 +1301,11 @@ export default class OracleCollection {
           }
         })
         .catch(error => {
+          if (isOraTableMissingError(error) && !retrying) {
+            this._tableVerified = false;
+            logger.warn('Retrying _rawFind after ORA-00942 for collection ' + this._name);
+            return this._rawFind(query, retval, retryOptions, true);
+          }
           logger.error('Error running findOperation GetDocuments, ERROR =' + error);
           throw error;
         });

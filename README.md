@@ -184,7 +184,15 @@ ORACLE_CLIENT_LOCATION=/Users/myuser/instantclient_19_16  npm start -- ./config.
 
     ```
 
- 
+
+### Resetting a Database (SODA-safe)
+If you drop SODA-backed tables directly (for example `DROP TABLE "_SCHEMA"`), the SODA metadata can remain and Parse may fail with ORA-00942 on startup. Prefer one of:
+
+- SQLcl SODA commands: `soda list` then `soda drop <collection>`
+- Drop and recreate the schema/user (removes all SODA metadata)
+
+Parse keeps an in-memory schema cache per process; restart Parse after any manual DB reset. For a full Oracle 26 SQL reset snippet, see the workspace `README.md`.
+
 ### Running against Autonomous Database in the cloud
 1. Update databaseAdapter.options.databaseURI in config.json to point at the cloud database instance
 
