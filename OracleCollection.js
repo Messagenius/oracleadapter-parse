@@ -1438,22 +1438,33 @@ export default class OracleCollection {
             .version(version)
             .replaceOne(updateObj);
 
-          if (replaceResult.replaced === true) {
+          let replaced = replaceResult.replaced === true;
+          // Bounded retry on optimistic-lock loss: re-read the doc and retry
+          // the replaceOne with the fresh version. Throw on final failure
+          // rather than silently dropping the doc from the result set.
+          const MAX_ATTEMPTS = 5;
+          let attempt = 1;
+          while (!replaced && attempt < MAX_ATTEMPTS) {
+            attempt += 1;
+            logger.verbose('updateMany: optimistic-lock retry ' + attempt + ' for key ' + key);
+            const retryResult = await this._rawFind({ _id: oldContent._id }, { type: 'one' });
+            if (!retryResult || Object.keys(retryResult).length === 0) {
+              break;
+            }
+            const retryReplaceResult = await this._oracleCollection
+              .find()
+              .key(retryResult.key)
+              .version(retryResult.version)
+              .replaceOne(updateObj);
+            replaced = retryReplaceResult.replaced === true;
+          }
+          if (replaced) {
             updatedDocs.push(updateObj);
           } else {
-            // Retry once if version mismatch
-            logger.verbose('updateMany: Retrying update for key ' + key);
-            const retryResult = await this._rawFind({ _id: oldContent._id }, { type: 'one' });
-            if (retryResult && Object.keys(retryResult).length > 0) {
-              const retryReplaceResult = await this._oracleCollection
-                .find()
-                .key(retryResult.key)
-                .version(retryResult.version)
-                .replaceOne(updateObj);
-              if (retryReplaceResult.replaced === true) {
-                updatedDocs.push(updateObj);
-              }
-            }
+            throw new Parse.Error(
+              Parse.Error.INTERNAL_SERVER_ERROR,
+              'updateMany: optimistic-lock retries exhausted for _id ' + oldContent._id
+            );
           }
         } finally {
           if (localConn) {
