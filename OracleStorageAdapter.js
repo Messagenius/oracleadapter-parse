@@ -467,16 +467,12 @@ export class OracleStorageAdapter implements StorageAdapter {
     logger.verbose('StorageAdapter deleteFields for className: ' + className);
     logger.verbose('StorageAdapter deleteFields for schema: ' + schema);
     logger.verbose('StorageAdapter deleteFields oracleFormatNames = ' + fieldNames);
-    // Drop the field from the schema only. Per-document column data remains
-    // in stored SODA documents; deliberately do NOT walk the collection to
-    // strip the field from every row, because that path was previously
-    // triggered by per-row $unset operations and wiped fields globally.
-    // Mongo's deleteFields semantics (column gone for everyone) is
-    // approximated by the schema drop: future writes will not see the
-    // field and stale per-row values are inert.
     try {
-      const result = await this._schemaCollection().deleteSchemaFields(className, fieldNames);
-      logger.verbose('StorageAdapter deleteFields schemacollection result =  ' + result);
+      const collection = this._adaptiveCollection(className);
+      const result = await collection.deleteFields(fieldNames);
+      const result1 = await this._schemaCollection().deleteSchemaFields(className, fieldNames);
+      logger.verbose('StorageAdapter deleteFields collection result =  ' + result);
+      logger.verbose('StorageAdapter deleteFields schemacollection result =  ' + result1);
     } catch (error) {
       logger.error('StorageAdapter deleteFields Error for ' + className);
       this.handleError(error);

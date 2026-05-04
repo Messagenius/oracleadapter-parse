@@ -563,6 +563,122 @@ export default class OracleCollection {
     }
   }
 
+  // Delete fields from all documents in a collection.
+  // ONLY safe for schema-level field drops (StorageAdapter.deleteFields,
+  // i.e. the _SCHEMA "remove this column for the whole class" API). Do
+  // NOT call from per-row update paths: a per-row $unset must touch only
+  // the matched row, never sweep the whole collection.
+  async deleteFields(fieldNames: Array<string>) {
+    try {
+      var promises = Array();
+      // Rewriting like createIndexes, Collection method will just delete a field
+      logger.verbose(
+        'DeleteFields ' + JSON.stringify(fieldNames) + ' for Collection ' + this._name
+      );
+      for (let idx = 0; idx < fieldNames.length; idx++) {
+        const fieldName = fieldNames[idx];
+        logger.verbose('about to delete field' + fieldName);
+        const promise = this.deleteFieldFromCollection(fieldName)
+          .then(promise => {
+            if (promise === 'retry') {
+              return this.deleteFieldFromCollection(fieldName);
+            }
+            return promise;
+          })
+          .catch(error => {
+            logger.error('Collection deleteFields caught error ' + error.message);
+            throw error;
+          });
+        promises.push(promise);
+      }
+
+      const results = await Promise.all(promises);
+      logger.verbose('DeleteFields returns ' + results);
+      return results;
+    } catch (error) {
+      logger.error('Delete Fields ERROR: ', error);
+      throw error;
+    }
+  }
+
+  // deleteField from all docs in a collection that has it
+  async deleteFieldFromCollection(fieldName: string) {
+    try {
+      logger.verbose('deleteFieldFromCollection fieldName to delete is ' + fieldName);
+      const query = JSON.parse(`{"${fieldName}":{"$exists":true}}`);
+      const result = await this._rawFind(query, { type: 'all' }).then(result => {
+        return result;
+      });
+
+      if (result.length > 0) {
+        // found the doc, so we need to update it
+        var promises = Array();
+        for (let i = 0; i < result.length; i++) {
+          const promise = this.deleteField(
+            fieldName,
+            result[i].key,
+            result[i].version,
+            result[i].content
+          )
+            .then(promise => {
+              if (promise === 'retry') {
+                return this.deleteFieldFromCollection(fieldName);
+              }
+              return promise;
+            })
+            .catch(error => {
+              logger.error('deleteFieldFromConnection caught error ' + error.message);
+              throw error;
+            });
+          promises.push(promise);
+        }
+
+        const results = await Promise.all(promises);
+        logger.verbose('DeleteFieldFromCollection returns ' + results);
+        return results;
+      } else {
+        logger.verbose('Field ' + fieldName + ' Not Found In DeleteFieldFromCollection');
+        return false;
+      }
+    } catch (error) {
+      logger.error('Delete Field ERROR: ', error);
+      throw error;
+    }
+  }
+
+  // deleteField from a specific document containing it
+  async deleteField(fieldName: string, key: string, version: string, oldContent: string) {
+    logger.verbose('key = ' + key);
+    logger.verbose('version = ' + version);
+    logger.verbose('oldContent before delete = ' + JSON.stringify(oldContent));
+    delete oldContent[fieldName];
+    logger.verbose('oldContent after delete update = ' + JSON.stringify(oldContent));
+
+    let localConn = null;
+    return this.getCollectionConnection()
+      .then(conn => {
+        localConn = conn;
+        return this._oracleCollection.find().key(key).version(version).replaceOne(oldContent);
+      })
+      .then(result => {
+        if (result.replaced == true) {
+          return oldContent;
+        } else {
+          return 'retry';
+        }
+      })
+      .finally(async () => {
+        if (localConn) {
+          await localConn.close();
+          localConn = null;
+        }
+      })
+      .catch(error => {
+        logger.error('DeleteFieldFromCollection replaceOne ERROR: ', error);
+        throw error;
+      });
+  }
+
   //  Delete a field in a specific SCHEMA doc
   async deleteSchemaField(query: string, fieldName: string) {
     try {
