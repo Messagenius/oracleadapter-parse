@@ -715,9 +715,20 @@ function transformQueryKeyValue(className, key, value, schema, count = false) {
     schema && schema.fields[key] && schema.fields[key].type === 'Pointer';
 
   const field = schema && schema.fields[key];
+  // Apply the _p_ rename for Pointer queries when:
+  //   - the schema declares the field as a Pointer, OR
+  //   - we have no schema at all and the value looks like a Pointer, OR
+  //   - the schema is present but the field entry is missing (stale cache
+  //     after a newly-added pointer field) and the value looks like a
+  //     Pointer.
+  // The third case mirrors the equivalent fallback on the update side
+  // (transformKeyValueForUpdate); without it, a query against a freshly-
+  // added pointer field would target the un-renamed key and return no
+  // results until the schema cache catches up.
+  const valueLooksLikePointer = !key.includes('.') && value && value.__type === 'Pointer';
   if (
     expectedTypeIsPointer ||
-    (!schema && !key.includes('.') && value && value.__type === 'Pointer')
+    (valueLooksLikePointer && (!schema || !schema.fields[key]))
   ) {
     key = '_p_' + key;
   }
@@ -1017,7 +1028,12 @@ const transformKeyValueForUpdate = (className, restKey, restValue, parseFormatSc
   var value = transformTopLevelAtom(restValue);
   if (value !== CannotTransform) {
     if (restKey.indexOf('.') > 0) {
-      return { key, value: restValue };
+      // Dotted-key updates must still write the *encoded* value (e.g.
+      // "ClassName$objectId" string for Pointers, native Date for dates),
+      // not the raw Parse JSON shape. Returning restValue here was
+      // writing { __type: 'Pointer', ... } objects into nested document
+      // slots, breaking subsequent reads.
+      return { key, value };
     }
     return { key, value };
   }
