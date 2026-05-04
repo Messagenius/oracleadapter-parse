@@ -911,13 +911,15 @@ const transformUpdate = (className, restUpdate, parseFormatSchema) => {
       oraUpdate[out.value.__op] = oraUpdate[out.value.__op] || {};
       oraUpdate[out.value.__op][out.key] = out.value.arg;
     } else {
-      const dotNotation = out.key.split('.');
-      if (dotNotation.length === 2) {
-        // one level dot notation. This may need to be written for multiple levels
-        const newKey = dotNotation[1];
-        const newObj = new Object();
-        newObj[newKey] = out.value;
-        oraUpdate[dotNotation[0]] = newObj;
+      // Use lodash _.set to honor any dot-notation depth (a.b.c.d ...).
+      // Previously a 2-level path overwrote the parent and 3+ levels were
+      // written as a single literal flat top-level key (e.g. "a.b.c"),
+      // which Mongo would have stored as a nested object. _.set creates
+      // missing intermediate objects, leaves siblings of the leaf intact,
+      // and writes the leaf value at the correct depth. Keys without
+      // dots fall through to a normal assignment.
+      if (out.key.indexOf('.') >= 0) {
+        _.set(oraUpdate, out.key, out.value);
       } else {
         oraUpdate[out.key] = out.value;
       }
