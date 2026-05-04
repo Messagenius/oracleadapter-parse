@@ -922,22 +922,15 @@ const transformUpdate = (className, restUpdate, parseFormatSchema) => {
       oraUpdate[out.value.__op] = oraUpdate[out.value.__op] || {};
       oraUpdate[out.value.__op][out.key] = out.value.arg;
     } else {
-      const dotNotation = out.key.split('.');
-      if (dotNotation.length === 2) {
-        // One-level dotted update (e.g. "ACL.userId"). Merge the child
-        // into the existing parent slot rather than replacing it; otherwise
-        // a single update like { "ACL.userA": ... } would overwrite the
-        // whole ACL object and erase every other userId in it.
-        const [parent, child] = dotNotation;
-        if (
-          !oraUpdate[parent] ||
-          typeof oraUpdate[parent] !== 'object' ||
-          oraUpdate[parent] === null ||
-          Array.isArray(oraUpdate[parent])
-        ) {
-          oraUpdate[parent] = {};
-        }
-        oraUpdate[parent][child] = out.value;
+      // Combined behavior of PR #4 (dotted-sibling preservation) and PR #7
+      // (deep-dotted paths). lodash _.set creates missing intermediate
+      // objects, leaves siblings of the leaf intact, and writes the leaf
+      // value at any depth — which subsumes the depth-2 sibling fix from
+      // PR #4 (since _.set on a 2-key path is equivalent to merging the
+      // child into the parent slot). Keys without dots fall through to a
+      // plain assignment.
+      if (out.key.indexOf('.') >= 0) {
+        _.set(oraUpdate, out.key, out.value);
       } else {
         oraUpdate[out.key] = out.value;
       }
