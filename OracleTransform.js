@@ -959,22 +959,17 @@ const transformUpdate = (className, restUpdate, parseFormatSchema) => {
       oraUpdate[out.value.__op] = oraUpdate[out.value.__op] || {};
       oraUpdate[out.value.__op][out.key] = out.value.arg;
     } else {
-      const dotNotation = out.key.split('.');
-      if (dotNotation.length === 2) {
-        // One-level dotted update (e.g. "ACL.userId"). Merge the child
-        // into the existing parent slot rather than replacing it; otherwise
-        // a single update like { "ACL.userA": ... } would overwrite the
-        // whole ACL object and erase every other userId in it.
-        const [parent, child] = dotNotation;
-        if (
-          !oraUpdate[parent] ||
-          typeof oraUpdate[parent] !== 'object' ||
-          oraUpdate[parent] === null ||
-          Array.isArray(oraUpdate[parent])
-        ) {
-          oraUpdate[parent] = {};
-        }
-        oraUpdate[parent][child] = out.value;
+      // Use lodash _.set to honor any dot-notation depth (a.b.c.d ...).
+      // _.set writes only the leaf, creates missing intermediate objects,
+      // and leaves siblings of the leaf intact — so two updates that share
+      // a parent (e.g. ACL.userA and ACL.userB in the same call) both land
+      // without one clobbering the other. This subsumes the prior special
+      // case for 2-level paths and also fixes 3+ level paths, which used
+      // to fall through to the flat-literal-key else branch and get
+      // stored as a single top-level key like "a.b.c" instead of a nested
+      // object — Mongo's behavior.
+      if (out.key.indexOf('.') >= 0) {
+        _.set(oraUpdate, out.key, out.value);
       } else {
         oraUpdate[out.key] = out.value;
       }
