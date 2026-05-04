@@ -189,18 +189,16 @@ export default class OracleCollection {
         }
       });
 
-      // if FieldNames > 0, delete those fields and
-      // repalce update with newUpdate that has the $unset pairs removed
-      // Don't move deletefields to update transform code
+      // If $unset was sent, strip those keys off the in-memory copy of the
+      // single matched document and continue. Do NOT call a collection-wide
+      // delete here: Parse sends $unset for per-row clears (field.unset(),
+      // pointer null-outs, after-trigger cleanups) and a collection-wide
+      // strip wipes the field from every document, not just this row.
       if (fieldNames.length > 0) {
-        await this.deleteFields(fieldNames).then(result => {
-          update = newUpdate;
-          return result;
-        });
-        // Ya changed the key values get them again
-        result = await this._rawFind(query, { type: 'one' }).then(result => {
-          return result;
-        });
+        update = newUpdate;
+        if (result && result.content) {
+          fieldNames.forEach(fieldName => _.unset(result.content, fieldName));
+        }
       }
 
       // Process Increments  $inc
@@ -565,7 +563,11 @@ export default class OracleCollection {
     }
   }
 
-  // Delete fields from all documents in a collection
+  // Delete fields from all documents in a collection.
+  // ONLY safe for schema-level field drops (StorageAdapter.deleteFields,
+  // i.e. the _SCHEMA "remove this column for the whole class" API). Do
+  // NOT call from per-row update paths: a per-row $unset must touch only
+  // the matched row, never sweep the whole collection.
   async deleteFields(fieldNames: Array<string>) {
     try {
       var promises = Array();
