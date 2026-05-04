@@ -319,18 +319,13 @@ export default class OracleCollection {
         logger.verbose('oldContent = ' + JSON.stringify(oldContent));
         logger.verbose('update = ' + JSON.stringify(update));
 
-        // Check for empty object and remove it from original, no merging, replacing
-        Object.keys(update).forEach(item => {
-          if (
-            typeof update[item] === 'object' &&
-            update[item] !== null &&
-            item !== 'updatedAt' &&
-            Object.keys(update[item]).length === 0
-          ) {
-            _.unset(oldContent, item);
-          }
-        });
-
+        // Note: previously this block treated `{ foo: {} }` as an unset of
+        // `foo`. That's wrong: `_.merge(oldContent, { foo: {} })` is already
+        // a no-op for that field (matching Mongo). Genuine clears arrive
+        // via the $unset operator, which is handled above. Silently
+        // unsetting on empty objects deleted user data when callers passed
+        // pristine sub-objects through transforms that hadn't yet been
+        // populated.
         if (update.fieldName) {
           const theUpdate = { [update.fieldName]: update.theFieldType };
           logger.verbose('theUpdate = ' + JSON.stringify(theUpdate));
@@ -1380,18 +1375,9 @@ export default class OracleCollection {
         const version = result.version;
         const oldContent = currentContent;
 
-        // Check for empty object and remove it from original
-        Object.keys(currentUpdate).forEach(item => {
-          if (
-            typeof currentUpdate[item] === 'object' &&
-            currentUpdate[item] !== null &&
-            item !== 'updatedAt' &&
-            Object.keys(currentUpdate[item]).length === 0
-          ) {
-            _.unset(oldContent, item);
-          }
-        });
-
+        // (See findOneAndUpdate for the rationale.) An empty `{}` value in
+        // `update` must NOT silently unset the field; merge handles it as
+        // a no-op, which matches Mongo. Genuine clears go through $unset.
         if (currentUpdate.fieldName) {
           const theUpdate = { [currentUpdate.fieldName]: currentUpdate.theFieldType };
           updateObj = { ...oldContent, ...theUpdate };
