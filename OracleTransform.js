@@ -913,11 +913,20 @@ const transformUpdate = (className, restUpdate, parseFormatSchema) => {
     } else {
       const dotNotation = out.key.split('.');
       if (dotNotation.length === 2) {
-        // one level dot notation. This may need to be written for multiple levels
-        const newKey = dotNotation[1];
-        const newObj = new Object();
-        newObj[newKey] = out.value;
-        oraUpdate[dotNotation[0]] = newObj;
+        // One-level dotted update (e.g. "ACL.userId"). Merge the child
+        // into the existing parent slot rather than replacing it; otherwise
+        // a single update like { "ACL.userA": ... } would overwrite the
+        // whole ACL object and erase every other userId in it.
+        const [parent, child] = dotNotation;
+        if (
+          !oraUpdate[parent] ||
+          typeof oraUpdate[parent] !== 'object' ||
+          oraUpdate[parent] === null ||
+          Array.isArray(oraUpdate[parent])
+        ) {
+          oraUpdate[parent] = {};
+        }
+        oraUpdate[parent][child] = out.value;
       } else {
         oraUpdate[out.key] = out.value;
       }
