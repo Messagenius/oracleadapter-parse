@@ -640,9 +640,9 @@ export default class OracleCollection {
 
     let localConn = null;
     return this.getCollectionConnection()
-      .then(conn => {
+      .then(({ conn, collection }) => {
         localConn = conn;
-        return this._oracleCollection.find().key(key).version(version).replaceOne(oldContent);
+        return collection.find().key(key).version(version).replaceOne(oldContent);
       })
       .then(result => {
         if (result.replaced == true) {
@@ -1435,7 +1435,7 @@ export default class OracleCollection {
             if (!retryResult || Object.keys(retryResult).length === 0) {
               break;
             }
-            const retryReplaceResult = await this._oracleCollection
+            const retryReplaceResult = await collection
               .find()
               .key(retryResult.key)
               .version(retryResult.version)
