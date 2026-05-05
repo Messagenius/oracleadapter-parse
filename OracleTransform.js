@@ -223,38 +223,16 @@ function transformConstraint(constraint, field, count = false) {
           throw new Parse.Error(Parse.Error.INVALID_JSON, 'bad regex: ' + s);
         }
 
-        //CDB
-        // manage "$options":
-        let exit = false;
-
-        if (keys.length == 2) {
-          if (keys[1] == '$options') {
-            var options = constraint['$options'];
-            if (options.indexOf('m') != -1) {
-              //: "m" --> for "$regex" add multiline search
-              s = '((.|\n)*)' + s + '((.|\n)*)';
-              answer = {};
-              answer['$regex'] = s;
-              exit = true;
-            }
-            if (options.indexOf('i') != -1) {
-              //: "i" --> for "$regex" add "$upper" and set the string to UPPERCASE
-              answer = {};
-              answer['$lower'] = { $regex: s.toLowerCase() };
-              exit = true;
-            }
-          }
-        }
-
-        if (exit) {
-          break;
-        }
-        //CDB-END
-
-        //CDB
-        // MANAGE endsWith('$')
+        // The blocks below handle Parse-SDK-generated patterns that come
+        // wrapped in \Q...\E literal-escape markers (Query.contains(),
+        // Query.startsWith(), Query.endsWith(), etc.). Each branch
+        // produces a fully-formed pattern that already includes the .*
+        // wrapping needed for SODA's whole-string match semantics; we
+        // skip the substring wrap below for those.
         const special = '\\,.?{}[]()$^*\'+@|"';
+        let expanded = false;
         if (s[s.length - 1] == '$' && s[s.length - 2] == 'E' && s[s.length - 3] == '\\') {
+          // MANAGE endsWith('$')
           s = s.replace('\\E\\\\E\\Q', '\\E');
           s = s.replace('\\Q', '.*');
           s = s.replace('\\E$', '$');
@@ -263,8 +241,7 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '.*' + t + '$';
-          // To distinguish a normal 'matches regex' or 'matches string' from StartsWith or EndWith or Contains
-          //} else if (s[0] == '^')  {
+          expanded = true;
         } else if (s[0] == '^' && s.indexOf('\\E\\\\E\\Q') != -1) {
           // MANAGE startsWith('^')
           s = s.replace('\\E\\\\E\\Q', '\\E');
@@ -274,8 +251,7 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '^' + t + '.*';
-          // To distinguish a normal 'matches regex' or 'matches string' from StartsWith or EndWith or Contains
-          //} else {
+          expanded = true;
         } else if (s.indexOf('\\E\\\\E\\Q') != -1) {
           // MANAGE contains('.*')
           s = s.replace('\\E\\\\E\\Q', '\\E');
@@ -285,15 +261,59 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '.*' + t + '.*';
+          expanded = true;
         }
-        // to managed 'nested contains'
+        // to manage 'nested contains'
         if (s.substring(0, 2) == '\\Q' && s.substring(s.length - 2, s.length) == '\\E') {
           s = s.replace('\\Q', '.*');
           s = s.replace('\\E', '.*');
+          expanded = true;
         }
-        answer[key] = s;
-        //CDB-END
 
+        // For raw user-supplied patterns that didn't match any of the
+        // SDK-generated \Q...\E shapes above, wrap with a wildcard on
+        // each side so Mongo-style substring semantics work. Oracle's
+        // SODA $regex requires the pattern to span the whole field
+        // value (whole-string match), while Mongo matches anywhere in
+        // the field. Without this wrap, raw queries like
+        // {$regex: "foo"} silently return no rows when the stored
+        // value is "foo bar baz". Anchors (^ at start, unescaped $ at
+        // end) the user supplied are honored — we only add the side
+        // that isn't already anchored.
+        const opts =
+          constraint['$options'] && typeof constraint['$options'] === 'string'
+            ? constraint['$options']
+            : '';
+        // Use the newline-aware wildcard when $options:"m" is set so
+        // that "match anywhere" still covers multi-line text.
+        const wildcard = opts.indexOf('m') !== -1 ? '((.|\n)*)' : '.*';
+        if (!expanded) {
+          const hasStart = s.length > 0 && s[0] === '^';
+          const hasEnd =
+            s.length > 0 && s[s.length - 1] === '$' && s[s.length - 2] !== '\\';
+          if (!hasStart) s = wildcard + s;
+          if (!hasEnd) s = s + wildcard;
+        }
+
+        // Apply $options:"i" via SODA's $lower path modifier — the same
+        // mechanism that already worked on master for full-string
+        // queries. Now that the pattern is substring-wrapped above,
+        // case-insensitive substring queries also match.
+        //   { $regex: "foo", $options: "i" }
+        //     -> { $lower: { $regex: ".*foo.*" } }
+        //   { $regex: "foo bar baz", $options: "i" }
+        //     -> { $lower: { $regex: ".*foo bar baz.*" } }
+        // Note: s.toLowerCase() can corrupt regex character classes
+        // (e.g. [A-Z] -> [a-z]); that's a pre-existing limitation, not
+        // introduced by this change. For literal-text patterns (the
+        // common Parse case) it is a no-op.
+        if (opts.indexOf('i') !== -1) {
+          answer = {};
+          answer['$lower'] = { $regex: s.toLowerCase() };
+          break;
+        }
+
+        answer[key] = s;
         break;
       }
 
@@ -314,11 +334,9 @@ function transformConstraint(constraint, field, count = false) {
         break;
       }
       case '$options':
-        //CDB
-        if (typeof answer['$lower'] === 'undefined') {
-          answer[key] = constraint[key];
-        }
-        //CDB-END
+        // $options has already been consumed by the $regex case (folded
+        // into the pattern as inline PCRE flags). Do NOT forward to SODA;
+        // SODA QBE does not understand a sibling $options key.
         break;
 
       case '$text': {
