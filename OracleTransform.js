@@ -223,27 +223,16 @@ function transformConstraint(constraint, field, count = false) {
           throw new Parse.Error(Parse.Error.INVALID_JSON, 'bad regex: ' + s);
         }
 
-        // Fold Mongo-style $options flags into the regex itself using
-        // inline PCRE flag groups, which Oracle's regex engine accepts
-        // directly:
-        //   { $regex: "te", $options: "i" } -> { $regex: "(?i)te" }
-        // The previous rewrite produced { $lower: { $regex: ... } }, which
-        // is not a valid SODA QBE construct and silently returned no rows
-        // even on plain text fields. Inline flags work for scalars and
-        // arrays, are not gated on the constraint's exact key count, and
-        // do not corrupt character classes the way String.toLowerCase()
-        // on the pattern did.
-        if (constraint['$options']) {
-          const opts = constraint['$options'];
-          if (typeof opts === 'string' && opts.length > 0) {
-            s = '(?' + opts + ')' + s;
-          }
-        }
-
-        //CDB
-        // MANAGE endsWith('$')
+        // The blocks below handle Parse-SDK-generated patterns that come
+        // wrapped in \Q...\E literal-escape markers (Query.contains(),
+        // Query.startsWith(), Query.endsWith(), etc.). Each branch
+        // produces a fully-formed pattern that already includes the .*
+        // wrapping needed for SODA's whole-string match semantics; we
+        // skip the substring wrap below for those.
         const special = '\\,.?{}[]()$^*\'+@|"';
+        let expanded = false;
         if (s[s.length - 1] == '$' && s[s.length - 2] == 'E' && s[s.length - 3] == '\\') {
+          // MANAGE endsWith('$')
           s = s.replace('\\E\\\\E\\Q', '\\E');
           s = s.replace('\\Q', '.*');
           s = s.replace('\\E$', '$');
@@ -252,8 +241,7 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '.*' + t + '$';
-          // To distinguish a normal 'matches regex' or 'matches string' from StartsWith or EndWith or Contains
-          //} else if (s[0] == '^')  {
+          expanded = true;
         } else if (s[0] == '^' && s.indexOf('\\E\\\\E\\Q') != -1) {
           // MANAGE startsWith('^')
           s = s.replace('\\E\\\\E\\Q', '\\E');
@@ -263,8 +251,7 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '^' + t + '.*';
-          // To distinguish a normal 'matches regex' or 'matches string' from StartsWith or EndWith or Contains
-          //} else {
+          expanded = true;
         } else if (s.indexOf('\\E\\\\E\\Q') != -1) {
           // MANAGE contains('.*')
           s = s.replace('\\E\\\\E\\Q', '\\E');
@@ -274,15 +261,59 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '.*' + t + '.*';
+          expanded = true;
         }
-        // to managed 'nested contains'
+        // to manage 'nested contains'
         if (s.substring(0, 2) == '\\Q' && s.substring(s.length - 2, s.length) == '\\E') {
           s = s.replace('\\Q', '.*');
           s = s.replace('\\E', '.*');
+          expanded = true;
         }
-        answer[key] = s;
-        //CDB-END
 
+        // For raw user-supplied patterns that didn't match any of the
+        // SDK-generated \Q...\E shapes above, wrap with a wildcard on
+        // each side so Mongo-style substring semantics work. Oracle's
+        // SODA $regex requires the pattern to span the whole field
+        // value (whole-string match), while Mongo matches anywhere in
+        // the field. Without this wrap, raw queries like
+        // {$regex: "foo"} silently return no rows when the stored
+        // value is "foo bar baz". Anchors (^ at start, unescaped $ at
+        // end) the user supplied are honored — we only add the side
+        // that isn't already anchored.
+        const opts =
+          constraint['$options'] && typeof constraint['$options'] === 'string'
+            ? constraint['$options']
+            : '';
+        // Use the newline-aware wildcard when $options:"m" is set so
+        // that "match anywhere" still covers multi-line text.
+        const wildcard = opts.indexOf('m') !== -1 ? '((.|\n)*)' : '.*';
+        if (!expanded) {
+          const hasStart = s.length > 0 && s[0] === '^';
+          const hasEnd =
+            s.length > 0 && s[s.length - 1] === '$' && s[s.length - 2] !== '\\';
+          if (!hasStart) s = wildcard + s;
+          if (!hasEnd) s = s + wildcard;
+        }
+
+        // Apply $options:"i" via SODA's $lower path modifier — the same
+        // mechanism that already worked on master for full-string
+        // queries. Now that the pattern is substring-wrapped above,
+        // case-insensitive substring queries also match.
+        //   { $regex: "foo", $options: "i" }
+        //     -> { $lower: { $regex: ".*foo.*" } }
+        //   { $regex: "foo bar baz", $options: "i" }
+        //     -> { $lower: { $regex: ".*foo bar baz.*" } }
+        // Note: s.toLowerCase() can corrupt regex character classes
+        // (e.g. [A-Z] -> [a-z]); that's a pre-existing limitation, not
+        // introduced by this change. For literal-text patterns (the
+        // common Parse case) it is a no-op.
+        if (opts.indexOf('i') !== -1) {
+          answer = {};
+          answer['$lower'] = { $regex: s.toLowerCase() };
+          break;
+        }
+
+        answer[key] = s;
         break;
       }
 
