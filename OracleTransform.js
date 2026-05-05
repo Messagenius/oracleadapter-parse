@@ -223,33 +223,22 @@ function transformConstraint(constraint, field, count = false) {
           throw new Parse.Error(Parse.Error.INVALID_JSON, 'bad regex: ' + s);
         }
 
-        //CDB
-        // manage "$options":
-        let exit = false;
-
-        if (keys.length == 2) {
-          if (keys[1] == '$options') {
-            var options = constraint['$options'];
-            if (options.indexOf('m') != -1) {
-              //: "m" --> for "$regex" add multiline search
-              s = '((.|\n)*)' + s + '((.|\n)*)';
-              answer = {};
-              answer['$regex'] = s;
-              exit = true;
-            }
-            if (options.indexOf('i') != -1) {
-              //: "i" --> for "$regex" add "$upper" and set the string to UPPERCASE
-              answer = {};
-              answer['$lower'] = { $regex: s.toLowerCase() };
-              exit = true;
-            }
+        // Fold Mongo-style $options flags into the regex itself using
+        // inline PCRE flag groups, which Oracle's regex engine accepts
+        // directly:
+        //   { $regex: "te", $options: "i" } -> { $regex: "(?i)te" }
+        // The previous rewrite produced { $lower: { $regex: ... } }, which
+        // is not a valid SODA QBE construct and silently returned no rows
+        // even on plain text fields. Inline flags work for scalars and
+        // arrays, are not gated on the constraint's exact key count, and
+        // do not corrupt character classes the way String.toLowerCase()
+        // on the pattern did.
+        if (constraint['$options']) {
+          const opts = constraint['$options'];
+          if (typeof opts === 'string' && opts.length > 0) {
+            s = '(?' + opts + ')' + s;
           }
         }
-
-        if (exit) {
-          break;
-        }
-        //CDB-END
 
         //CDB
         // MANAGE endsWith('$')
@@ -314,11 +303,9 @@ function transformConstraint(constraint, field, count = false) {
         break;
       }
       case '$options':
-        //CDB
-        if (typeof answer['$lower'] === 'undefined') {
-          answer[key] = constraint[key];
-        }
-        //CDB-END
+        // $options has already been consumed by the $regex case (folded
+        // into the pattern as inline PCRE flags). Do NOT forward to SODA;
+        // SODA QBE does not understand a sibling $options key.
         break;
 
       case '$text': {
