@@ -299,7 +299,31 @@ export class OracleStorageAdapter implements StorageAdapter {
     const pw = this.getPasswordFromUri(this._uri);
     const tnsname = this.getTnsNameFromUri(this._uri);
 
-    logger.info('creating a connection pool');
+    // Pool sizing and statistics flag are read from environment variables so
+    // operators can tune them per-deployment without forking the adapter.
+    // Empty / unset / non-numeric values fall back to the previous hard-coded
+    // defaults — out-of-the-box behavior is unchanged.
+    const intEnv = (name, fallback) => {
+      const v = process.env[name];
+      if (!v) return fallback;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    const boolEnv = (name, fallback) => {
+      const v = process.env[name];
+      if (!v) return fallback;
+      return !/^(0|false|no|off)$/i.test(v);
+    };
+    const poolOptions = {
+      poolIncrement: intEnv('PARSE_ORACLE_POOL_INCREMENT', 5),
+      poolMax: intEnv('PARSE_ORACLE_POOL_MAX', 100),
+      poolMin: intEnv('PARSE_ORACLE_POOL_MIN', 3),
+      poolTimeout: intEnv('PARSE_ORACLE_POOL_TIMEOUT', 10),
+      queueTimeout: intEnv('PARSE_ORACLE_QUEUE_TIMEOUT', 60000),
+      enableStatistics: boolEnv('PARSE_ORACLE_ENABLE_STATISTICS', true),
+    };
+
+    logger.info('creating a connection pool with options: ' + JSON.stringify(poolOptions));
     try {
       if (createConnPool) {
         createConnPool = false;
@@ -308,13 +332,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           user: user,
           password: pw,
           connectString: tnsname,
-          poolIncrement: 5,
-          poolMax: 100,
-          poolMin: 3,
-          poolTimeout: 10,
-          //  Use default of 60000 ms
-          //          queueTimeout: 10,
-          enableStatistics: true,
+          ...poolOptions,
         });
         logger.info('connection pool successfully created');
         this._connectionPool = oracledb.getPool('parse');
