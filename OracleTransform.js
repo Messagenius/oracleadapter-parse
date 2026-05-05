@@ -224,34 +224,24 @@ function transformConstraint(constraint, field, count = false) {
         }
 
         //CDB
-        // manage "$options":
-        let exit = false;
-
-        if (keys.length == 2) {
-          if (keys[1] == '$options') {
-            var options = constraint['$options'];
-            if (options.indexOf('m') != -1) {
-              //: "m" --> for "$regex" add multiline search
-              s = '((.|\n)*)' + s + '((.|\n)*)';
-              answer = {};
-              answer['$regex'] = s;
-              exit = true;
-            }
-            if (options.indexOf('i') != -1) {
-              //: "i" --> for "$regex" add "$upper" and set the string to UPPERCASE
-              answer = {};
-              answer['$lower'] = { $regex: s.toLowerCase() };
-              exit = true;
-            }
-          }
-        }
-
-        if (exit) {
-          break;
-        }
+        // Detect $options once up front. It influences both the wildcard
+        // used for the substring wrap below ("m" needs newline-aware) and
+        // the post-wrap rewrite (`i` -> $lower). Honor $options whenever
+        // it is a sibling string — don't gate on the number of sibling
+        // keys, so future Parse additions to the constraint shape can't
+        // silently make $options stop working.
+        const opts =
+          typeof constraint['$options'] === 'string' ? constraint['$options'] : '';
+        const wildcard = opts.indexOf('m') !== -1 ? '((.|\n)*)' : '.*';
         //CDB-END
 
         //CDB
+        // SDK Parse patterns ship literal-escape markers ( \Q...\E ) that
+        // the adapter expands into whole-string regexes. Track whether any
+        // of those expansions fires so the fall-through (raw user pattern)
+        // can be wrapped below.
+        let expanded = false;
+
         // MANAGE endsWith('$')
         const special = '\\,.?{}[]()$^*\'+@|"';
         if (s[s.length - 1] == '$' && s[s.length - 2] == 'E' && s[s.length - 3] == '\\') {
@@ -263,6 +253,7 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '.*' + t + '$';
+          expanded = true;
           // To distinguish a normal 'matches regex' or 'matches string' from StartsWith or EndWith or Contains
           //} else if (s[0] == '^')  {
         } else if (s[0] == '^' && s.indexOf('\\E\\\\E\\Q') != -1) {
@@ -274,6 +265,7 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '^' + t + '.*';
+          expanded = true;
           // To distinguish a normal 'matches regex' or 'matches string' from StartsWith or EndWith or Contains
           //} else {
         } else if (s.indexOf('\\E\\\\E\\Q') != -1) {
@@ -285,12 +277,57 @@ function transformConstraint(constraint, field, count = false) {
             t = t.replaceAll(special[i], '\\' + special[i]);
           }
           s = '.*' + t + '.*';
+          expanded = true;
         }
         // to managed 'nested contains'
         if (s.substring(0, 2) == '\\Q' && s.substring(s.length - 2, s.length) == '\\E') {
           s = s.replace('\\Q', '.*');
           s = s.replace('\\E', '.*');
+          expanded = true;
         }
+
+        // Raw user-supplied patterns (no SDK markers fired) need wrapping:
+        // Oracle SODA's $regex evaluates against the whole field value,
+        // while Mongo's $regex matches anywhere. Wrap with a wildcard on
+        // each side to give Oracle equivalent substring semantics, while
+        // honoring user-supplied ^ / $ anchors.
+        //
+        //   foo          -> .*foo.*
+        //   ^foo         -> ^foo.*
+        //   foo$         -> .*foo$
+        //   ^foo$        -> ^foo$
+        //   foo bar baz  -> .*foo bar baz.*
+        if (!expanded) {
+          const hasStart = s.length > 0 && s[0] === '^';
+          const hasEnd =
+            s.length > 0 &&
+            s[s.length - 1] === '$' &&
+            (s.length < 2 || s[s.length - 2] !== '\\');
+          if (!hasStart) s = wildcard + s;
+          if (!hasEnd) s = s + wildcard;
+        }
+
+        // $options handling — applied AFTER the substring wrap so case-
+        // insensitive and multiline substring queries both match.
+        //   "i" -> use SODA's $lower path modifier (empirically verified
+        //          on the target Oracle versions). Note s.toLowerCase()
+        //          can corrupt regex character classes (e.g. [A-Z] ->
+        //          [a-z]); for the common Parse literal-text case this
+        //          is a no-op. Pre-existing limitation.
+        //   "m" -> the wildcard above is already newline-aware; emit the
+        //          wrapped pattern as $regex. Original $options:"m"
+        //          handling preserved.
+        if (opts.indexOf('i') !== -1) {
+          answer = {};
+          answer['$lower'] = { $regex: s.toLowerCase() };
+          break;
+        }
+        if (opts.indexOf('m') !== -1) {
+          answer = {};
+          answer['$regex'] = s;
+          break;
+        }
+
         answer[key] = s;
         //CDB-END
 
