@@ -640,37 +640,80 @@ const nestedOracleObjectToNestedParseObject = oracleObject => {
 function transformQueryKeyValue(className, key, value, schema, count = false) {
   switch (key) {
     case 'createdAt':
-      //if (valueAsDate(value)) {
-      //  return { key: '_created_at', value: valueAsDate(value) };
-      //}
-      //CDB
-      if (!(value[Object.keys(value)[0]].iso == undefined)) {
-        const operator = Object.keys(value)[0];
-        return {
-          key: 'createdAt',
-          value: { $timestamp: { [operator]: valueAsDate(value[Object.keys(value)[0]].iso) } },
-        };
-      } else if (valueAsDate(value)) {
-        return {
-          key: '_created_at',
-          value: valueAsDate(value),
-        };
+    case 'updatedAt': {
+      // createdAt and updatedAt are persisted on the document under their
+      // raw names (transformKey returns them unchanged — the old Mongo-
+      // style _created_at / _updated_at column names are commented out
+      // there). The previous query path here had two narrow shortcuts
+      // (createdAt for the {$op: {__type:"Date", iso}} shape, updatedAt
+      // for raw Date values) and otherwise fell through to those obsolete
+      // names — making any other constraint silently target a non-
+      // existent column and match 0 rows.
+      //
+      // Symptoms before the fix, against rows that demonstrably exist:
+      //   updatedAt with any operator                 -> 0
+      //   createdAt $exists: true                     -> 0
+      //   createdAt = {__type:"Date", iso:...}        -> 0
+      // (createdAt with $gt/$gte/$lt/$lte still worked because that
+      // input shape happened to match the iso shortcut.)
+      //
+      // Route every constraint to the real column name and wrap date
+      // operands in SODA's $timestamp path modifier so they evaluate
+      // against the column as TIMESTAMP. $exists takes a boolean and
+      // is not a date operator, so it stays outside $timestamp.
+      const realKey = key;
+      const toDate = v => {
+        const d = valueAsDate(v);
+        if (d) return d;
+        if (
+          v &&
+          typeof v === 'object' &&
+          v.__type === 'Date' &&
+          typeof v.iso === 'string'
+        ) {
+          return new Date(v.iso);
+        }
+        return null;
+      };
+
+      // Direct value (no operator wrapper) -> exact equality.
+      const direct = toDate(value);
+      if (direct) {
+        return { key: realKey, value: { $timestamp: { $eq: direct } } };
       }
-      //CDB-END
-      key = '_created_at';
-      break;
-    case 'updatedAt':
-      if (valueAsDate(value)) {
-        return {
-          //CDB
-          //key: '_updated_at',
-          key: 'updatedAt',
-          //CDB-END
-          value: valueAsDate(value),
-        };
+
+      // Constraint object: rewrite each operator's value into a JS Date
+      // and wrap the date-bearing operators with $timestamp. $exists is
+      // routed alongside, not inside, $timestamp.
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const cast = {};
+        let hasDateOp = false;
+        let exists;
+        for (const op of Object.keys(value)) {
+          if (op === '$exists') {
+            exists = value[op];
+          } else if (op === '$in' || op === '$nin') {
+            const arr = Array.isArray(value[op]) ? value[op] : [];
+            cast[op] = arr.map(x => toDate(x) || x);
+            hasDateOp = true;
+          } else {
+            const d = toDate(value[op]);
+            cast[op] = d || value[op];
+            hasDateOp = true;
+          }
+        }
+        const result = {};
+        if (hasDateOp) result.$timestamp = cast;
+        if (typeof exists !== 'undefined') result.$exists = exists;
+        return { key: realKey, value: result };
       }
-      key = '_updated_at';
+
+      // Anything else (e.g. null, primitive that isn't a date string) —
+      // at least direct it at the right column rather than dropping into
+      // a column that does not exist on disk.
+      key = realKey;
       break;
+    }
     case 'expiresAt':
       if (valueAsDate(value)) {
         return { key: 'expiresAt', value: valueAsDate(value) };
