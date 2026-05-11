@@ -46,6 +46,63 @@ const valueAsDate = value => {
   return false;
 };
 
+// Build a query-side constraint for a Date-typed field. Coerces JS Date /
+// ISO string / Parse Date wrapper ({ __type:"Date", iso:"..." }) into a
+// JS Date and wraps date-bearing operators with SODA's $timestamp path
+// modifier so the column is evaluated as TIMESTAMP. $exists is routed
+// alongside, not inside, $timestamp because it takes a boolean. Returns
+// null when the value isn't a recognized date-shaped input — the caller
+// then falls through to the schema-driven path with the right column name.
+const buildDateFieldConstraint = (realKey, value) => {
+  const toDate = v => {
+    const d = valueAsDate(v);
+    if (d) return d;
+    if (
+      v &&
+      typeof v === 'object' &&
+      v.__type === 'Date' &&
+      typeof v.iso === 'string'
+    ) {
+      return new Date(v.iso);
+    }
+    return null;
+  };
+
+  // Direct value (no operator wrapper) -> exact equality.
+  const direct = toDate(value);
+  if (direct) {
+    return { key: realKey, value: { $timestamp: { $eq: direct } } };
+  }
+
+  // Constraint object: rewrite each operator's value into a JS Date and
+  // wrap the date-bearing operators with $timestamp. $exists is routed
+  // alongside, not inside, $timestamp.
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const cast = {};
+    let hasDateOp = false;
+    let exists;
+    for (const op of Object.keys(value)) {
+      if (op === '$exists') {
+        exists = value[op];
+      } else if (op === '$in' || op === '$nin') {
+        const arr = Array.isArray(value[op]) ? value[op] : [];
+        cast[op] = arr.map(x => toDate(x) || x);
+        hasDateOp = true;
+      } else {
+        const d = toDate(value[op]);
+        cast[op] = d || value[op];
+        hasDateOp = true;
+      }
+    }
+    const result = {};
+    if (hasDateOp) result.$timestamp = cast;
+    if (typeof exists !== 'undefined') result.$exists = exists;
+    return { key: realKey, value: result };
+  }
+
+  return null;
+};
+
 const isRegex = value => {
   return value && value instanceof RegExp;
 };
@@ -640,93 +697,22 @@ const nestedOracleObjectToNestedParseObject = oracleObject => {
 function transformQueryKeyValue(className, key, value, schema, count = false) {
   switch (key) {
     case 'createdAt':
-    case 'updatedAt': {
-      // createdAt and updatedAt are persisted on the document under their
-      // raw names (transformKey returns them unchanged — the old Mongo-
-      // style _created_at / _updated_at column names are commented out
-      // there). The previous query path here had two narrow shortcuts
-      // (createdAt for the {$op: {__type:"Date", iso}} shape, updatedAt
-      // for raw Date values) and otherwise fell through to those obsolete
-      // names — making any other constraint silently target a non-
-      // existent column and match 0 rows.
-      //
-      // Symptoms before the fix, against rows that demonstrably exist:
-      //   updatedAt with any operator                 -> 0
-      //   createdAt $exists: true                     -> 0
-      //   createdAt = {__type:"Date", iso:...}        -> 0
-      // (createdAt with $gt/$gte/$lt/$lte still worked because that
-      // input shape happened to match the iso shortcut.)
-      //
-      // Route every constraint to the real column name and wrap date
-      // operands in SODA's $timestamp path modifier so they evaluate
-      // against the column as TIMESTAMP. $exists takes a boolean and
-      // is not a date operator, so it stays outside $timestamp.
-      const realKey = key;
-      const toDate = v => {
-        const d = valueAsDate(v);
-        if (d) return d;
-        if (
-          v &&
-          typeof v === 'object' &&
-          v.__type === 'Date' &&
-          typeof v.iso === 'string'
-        ) {
-          return new Date(v.iso);
-        }
-        return null;
-      };
-
-      // Direct value (no operator wrapper) -> exact equality.
-      const direct = toDate(value);
-      if (direct) {
-        return { key: realKey, value: { $timestamp: { $eq: direct } } };
-      }
-
-      // Constraint object: rewrite each operator's value into a JS Date
-      // and wrap the date-bearing operators with $timestamp. $exists is
-      // routed alongside, not inside, $timestamp.
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        const cast = {};
-        let hasDateOp = false;
-        let exists;
-        for (const op of Object.keys(value)) {
-          if (op === '$exists') {
-            exists = value[op];
-          } else if (op === '$in' || op === '$nin') {
-            const arr = Array.isArray(value[op]) ? value[op] : [];
-            cast[op] = arr.map(x => toDate(x) || x);
-            hasDateOp = true;
-          } else {
-            const d = toDate(value[op]);
-            cast[op] = d || value[op];
-            hasDateOp = true;
-          }
-        }
-        const result = {};
-        if (hasDateOp) result.$timestamp = cast;
-        if (typeof exists !== 'undefined') result.$exists = exists;
-        return { key: realKey, value: result };
-      }
-
-      // Anything else (e.g. null, primitive that isn't a date string) —
-      // at least direct it at the right column rather than dropping into
-      // a column that does not exist on disk.
-      key = realKey;
+    case 'updatedAt':
+    case 'expiresAt':
+    case '_email_verify_token_expires_at': {
+      // Date-typed system fields stored under their Parse names on disk
+      // (transformKey returns them unchanged). The previous code only
+      // handled raw Date values / ISO strings, which Parse REST never
+      // sends — actual REST traffic arrives as Parse Date wrappers
+      // ({__type:"Date", iso:"..."}). Anything not matching that narrow
+      // shortcut fell through without the SODA $timestamp cast that
+      // TIMESTAMP comparison requires, and (for createdAt/updatedAt) was
+      // also re-keyed to obsolete _created_at/_updated_at columns. Both
+      // problems silently returned 0 rows.
+      const out = buildDateFieldConstraint(key, value);
+      if (out) return out;
       break;
     }
-    case 'expiresAt':
-      if (valueAsDate(value)) {
-        return { key: 'expiresAt', value: valueAsDate(value) };
-      }
-      break;
-    case '_email_verify_token_expires_at':
-      if (valueAsDate(value)) {
-        return {
-          key: '_email_verify_token_expires_at',
-          value: valueAsDate(value),
-        };
-      }
-      break;
     case 'objectId': {
       if (['_GlobalConfig', '_GraphQLConfig'].includes(className)) {
         value = parseInt(value);
@@ -734,30 +720,17 @@ function transformQueryKeyValue(className, key, value, schema, count = false) {
       return { key: '_id', value };
     }
     case '_account_lockout_expires_at':
-      if (valueAsDate(value)) {
-        return {
-          key: '_account_lockout_expires_at',
-          value: valueAsDate(value),
-        };
-      }
+    case '_perishable_token_expires_at':
+    case '_password_changed_at': {
+      // Same Date-system-field handling as above; see comment there.
+      const out = buildDateFieldConstraint(key, value);
+      if (out) return out;
       break;
+    }
     case '_failed_login_count':
       return { key, value };
     case 'sessionToken':
       return { key: '_session_token', value };
-    case '_perishable_token_expires_at':
-      if (valueAsDate(value)) {
-        return {
-          key: '_perishable_token_expires_at',
-          value: valueAsDate(value),
-        };
-      }
-      break;
-    case '_password_changed_at':
-      if (valueAsDate(value)) {
-        return { key: '_password_changed_at', value: valueAsDate(value) };
-      }
-      break;
     case '_rperm':
     case '_wperm':
     case '_perishable_token':
@@ -770,12 +743,15 @@ function transformQueryKeyValue(className, key, value, schema, count = false) {
         key: key,
         value: value.map(subQuery => transformWhere(className, subQuery, schema, count)),
       };
-    case 'lastUsed':
-      if (valueAsDate(value)) {
-        return { key: '_last_used', value: valueAsDate(value) };
-      }
+    case 'lastUsed': {
+      // lastUsed is persisted on disk as _last_used (see transformKey).
+      // Same Date-system-field handling as above, with the column-name
+      // remap baked into the helper call.
+      const out = buildDateFieldConstraint('_last_used', value);
+      if (out) return out;
       key = '_last_used';
       break;
+    }
     case 'timesUsed':
       return { key: 'times_used', value: value };
     default: {
