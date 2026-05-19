@@ -325,6 +325,24 @@ function transformConstraint(constraint, field, count = false) {
           expanded = true;
           // To distinguish a normal 'matches regex' or 'matches string' from StartsWith or EndWith or Contains
           //} else {
+        } else if (
+          s[0] == '^' &&
+          s.substring(1, 3) == '\\Q' &&
+          s.substring(s.length - 2, s.length) == '\\E'
+        ) {
+          // MANAGE startsWith('^') without the \E\\E\Q joining marker.
+          // The Parse SDK only emits that marker when the literal text it
+          // escapes contains \E itself; for the common case Query.startsWith
+          // produces a plain ^\Q...\E which the branch above misses, and
+          // the \Q...\E markers then leak through to Oracle (which does not
+          // understand them) and silently match zero rows.
+          //   ^\QTest\E -> ^Test.*
+          let t = s.substring(3, s.length - 2);
+          for (const i in special) {
+            t = t.replaceAll(special[i], '\\' + special[i]);
+          }
+          s = '^' + t + '.*';
+          expanded = true;
         } else if (s.indexOf('\\E\\\\E\\Q') != -1) {
           // MANAGE contains('.*')
           s = s.replace('\\E\\\\E\\Q', '\\E');
