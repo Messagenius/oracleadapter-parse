@@ -765,6 +765,17 @@ function transformQueryKeyValue(className, key, value, schema, count = false) {
     }
   }
 
+  // User-defined Date fields share the SODA TIMESTAMP comparison defect
+  // the system Date columns above had: without the $timestamp path
+  // modifier, $gt/$gte/$lt/$lte/$eq silently match zero rows. Route
+  // schema-declared Date fields through the same helper. The helper
+  // returns null for non-date-shaped values (e.g. a regex on a Date
+  // field), in which case fall through to the generic path below.
+  if (schema && schema.fields[key] && schema.fields[key].type === 'Date') {
+    const out = buildDateFieldConstraint(key, value);
+    if (out) return out;
+  }
+
   const expectedTypeIsArray = schema && schema.fields[key] && schema.fields[key].type === 'Array';
 
   const expectedTypeIsPointer =
