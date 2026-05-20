@@ -7,8 +7,6 @@ import OracleStorageAdapter from './OracleStorageAdapter';
 
 const oracledb = require('oracledb');
 oracledb.autoCommit = true;
-const Collection = oracledb.SodaCollection;
-const SodaDB = oracledb.SodaDB;
 
 const DB_VERSION = process.env.ORACLEDB_VERSION;
 const ddlTimeOut = `
@@ -19,8 +17,6 @@ BEGIN
 END;`;
 
 export default class OracleCollection {
-  _oracleSodaDB: SodaDB;
-  _oracleCollection: Collection;
   _oracleStorageAdapter: OracleStorageAdapter;
   _name: string;
   indexes = new Array();
@@ -30,7 +26,6 @@ export default class OracleCollection {
   constructor(oracleStorageAdapter: OracleStorageAdapter, collectionName: String) {
     this._oracleStorageAdapter = oracleStorageAdapter;
     this._name = collectionName;
-    this._oracleCollection = undefined;
     logger.verbose('Oracle Database Version = ' + DB_VERSION);
     // To support backwards compatibility with instant clients
     if (typeof DB_VERSION !== 'undefined' && DB_VERSION !== '23') {
@@ -39,6 +34,16 @@ export default class OracleCollection {
   }
 
   async getCollectionConnection() {
+    // Returns { conn, collection } as locals so concurrent callers do NOT
+    // share state. Previously this method assigned the SODA collection
+    // (and SodaDatabase) to instance fields; under concurrent writes a
+    // second call would mutate this._oracleCollection between when the
+    // first caller awaited it and when it ran .find()/.replaceOne(),
+    // causing operations to run against another caller's connection and
+    // trip the optimistic version check (or, worse, write to the wrong
+    // SODA collection if collections were ever opened against different
+    // SodaDatabases). Keep the conn+collection locked together as a
+    // returned tuple.
     const mymetadata = {
       keyColumn: { name: 'ID', assignmentMethod: 'UUID' },
       contentColumn: { name: 'JSON_DOCUMENT', sqlType: this.jsonSQLtype },
@@ -48,69 +53,53 @@ export default class OracleCollection {
     };
 
     logger.verbose('getCollectionConnection about to connect for collection ' + this._name);
-    let localConn;
-    this._oracleCollection = await this._oracleStorageAdapter
-      .connect()
-      .then(p => {
-        logger.verbose('getCollectionConnection about to get connection from pool ');
-        logger.verbose('  statistics: ' + JSON.stringify(p.getStatistics()));
-        return p.getConnection();
-      })
-      .then(conn => {
-        logger.verbose('getCollectionConnection about to get SodaDB');
-        localConn = conn;
-        return conn.getSodaDatabase();
-      })
-      .then(sodadb => {
-        logger.verbose('getCollectionConnection open collection for  ' + this._name);
-        this._oracleSodaDB = sodadb;
-        return sodadb.openCollection(this._name);
-      })
-      .then(async coll => {
-        if (!coll) {
-          logger.verbose('getCollectionConnection create NEW collection for  ' + this._name);
-          const newCollection = await this._oracleSodaDB.createCollection(this._name, {
-            metaData: mymetadata,
-          });
-
-          /*
-            Create index on _id for every new collection
-            This imitates Mongo behavior which happens automatically
-
-            Index names MUST be unique in a schema, append table name
-            cannot have two indexes with the same name in a single schema.
-          */
-          if (!this.idIndexCreating) {
-            this.idIndexCreating = true;
-            const indexName = 'ididx' + this._name;
-            const indexSpec = { name: indexName, unique: true, fields: [{ path: '_id' }] };
-            await newCollection.createIndex(indexSpec);
-            logger.verbose(
-              'getCollectionConnection successfully create _id index for  ' + this._name
-            );
-            // Add _id if it doesn't exist to indexes array
-            const found = this.indexes.find(item => {
-              return Object.keys(item)[0] === '_id_';
-            });
-            if (typeof found === 'undefined') {
-              this.indexes.push({ _id_: { _id: 1 } });
-            }
+    let conn;
+    try {
+      const pool = await this._oracleStorageAdapter.connect();
+      logger.verbose('getCollectionConnection about to get connection from pool ');
+      logger.verbose('  statistics: ' + JSON.stringify(pool.getStatistics()));
+      conn = await pool.getConnection();
+      const sodadb = conn.getSodaDatabase();
+      logger.verbose('getCollectionConnection open collection for  ' + this._name);
+      let collection = await sodadb.openCollection(this._name);
+      if (!collection) {
+        logger.verbose('getCollectionConnection create NEW collection for  ' + this._name);
+        collection = await sodadb.createCollection(this._name, { metaData: mymetadata });
+        // Create index on _id for every new collection. This imitates Mongo
+        // behavior which happens automatically. Index names MUST be unique
+        // in a schema, so the collection name is appended.
+        if (!this.idIndexCreating) {
+          this.idIndexCreating = true;
+          const indexName = 'ididx' + this._name;
+          const indexSpec = { name: indexName, unique: true, fields: [{ path: '_id' }] };
+          await collection.createIndex(indexSpec);
+          logger.verbose(
+            'getCollectionConnection successfully create _id index for  ' + this._name
+          );
+          const found = this.indexes.find(item => Object.keys(item)[0] === '_id_');
+          if (typeof found === 'undefined') {
+            this.indexes.push({ _id_: { _id: 1 } });
           }
-          return newCollection;
         }
-        return coll;
-      })
-      .catch(error => {
-        logger.error('getCollectionConnection ERROR:  ' + error);
-        throw error;
-      });
-    logger.verbose(
-      'getCollectionConnection returning collection for  ' +
-        this._name +
-        ' returned ' +
-        this._oracleCollection
-    );
-    return localConn;
+      }
+      logger.verbose(
+        'getCollectionConnection returning collection for  ' +
+          this._name +
+          ' returned ' +
+          collection
+      );
+      return { conn, collection };
+    } catch (error) {
+      logger.error('getCollectionConnection ERROR:  ' + error);
+      if (conn) {
+        try {
+          await conn.close();
+        } catch (closeErr) {
+          logger.warn('getCollectionConnection failed to close conn after error: ' + closeErr);
+        }
+      }
+      throw error;
+    }
   }
 
   // Atomically updates data in the database for a single (first) object that matched the query
@@ -368,9 +357,9 @@ export default class OracleCollection {
         logger.verbose('Updated Object = ' + JSON.stringify(updateObj));
         let localConn = null;
         return this.getCollectionConnection()
-          .then(conn => {
+          .then(({ conn, collection }) => {
             localConn = conn;
-            return this._oracleCollection.find().key(key).version(version).replaceOne(updateObj);
+            return collection.find().key(key).version(version).replaceOne(updateObj);
           })
           .then(result => {
             if (result.replaced == true) {
@@ -443,9 +432,9 @@ export default class OracleCollection {
 
       let localConn = null;
       return this.getCollectionConnection()
-        .then(conn => {
+        .then(({ conn, collection }) => {
           localConn = conn;
-          return this._oracleCollection.find().key(key).version(version).replaceOne(updateObj);
+          return collection.find().key(key).version(version).replaceOne(updateObj);
         })
         .then(result => {
           if (result.replaced == true) {
@@ -491,9 +480,9 @@ export default class OracleCollection {
 
         let localConn = null;
         return this.getCollectionConnection()
-          .then(conn => {
+          .then(({ conn, collection }) => {
             localConn = conn;
-            return this._oracleCollection.find().key(key).version(version).remove();
+            return collection.find().key(key).version(version).remove();
           })
           .finally(async () => {
             if (localConn) {
@@ -534,9 +523,9 @@ export default class OracleCollection {
           logger.verbose('version = ' + version);
           let localConn = null;
           return this.getCollectionConnection()
-            .then(conn => {
+            .then(({ conn, collection }) => {
               localConn = conn;
-              return this._oracleCollection.find().key(key).version(version).remove();
+              return collection.find().key(key).version(version).remove();
             })
             .finally(async () => {
               if (localConn) {
@@ -651,9 +640,9 @@ export default class OracleCollection {
 
     let localConn = null;
     return this.getCollectionConnection()
-      .then(conn => {
+      .then(({ conn, collection }) => {
         localConn = conn;
-        return this._oracleCollection.find().key(key).version(version).replaceOne(oldContent);
+        return collection.find().key(key).version(version).replaceOne(oldContent);
       })
       .then(result => {
         if (result.replaced == true) {
@@ -698,9 +687,9 @@ export default class OracleCollection {
 
         let localConn = null;
         return this.getCollectionConnection()
-          .then(conn => {
+          .then(({ conn, collection }) => {
             localConn = conn;
-            return this._oracleCollection.find().key(key).version(version).replaceOne(oldContent);
+            return collection.find().key(key).version(version).replaceOne(oldContent);
           })
           .then(result => {
             if (result.replaced == true) {
@@ -790,25 +779,26 @@ export default class OracleCollection {
       // TODO:  MUST FIX
       var index = {};
       index[key] = '2d';
-      await this.getCollectionConnection();
-
-      const result = await this._oracleCollection
-        .createIndex(index)
-        // Retry, but just once.
-        .then(() =>
-          this._rawFind(query, {
-            skip,
-            limit,
-            sort,
-            keys,
-            maxTimeMS,
-            readPreference,
-            hint,
-            caseInsensitive,
-            explain,
-          })
-        );
-      this.closeConnection();
+      const { conn: indexConn, collection: indexCollection } = await this.getCollectionConnection();
+      try {
+        await indexCollection.createIndex(index);
+      } finally {
+        if (indexConn) {
+          await indexConn.close();
+        }
+      }
+      // Retry the find, just once.
+      const result = await this._rawFind(query, {
+        skip,
+        limit,
+        sort,
+        keys,
+        maxTimeMS,
+        readPreference,
+        hint,
+        caseInsensitive,
+        explain,
+      });
       return result.map(i => i.getContent());
     }
   }
@@ -829,7 +819,7 @@ export default class OracleCollection {
       sortTypes,
     } = {}
   ) {
-    logger.verbose('_rawFind: collection = ' + JSON.stringify(this._oracleCollection));
+    logger.verbose('_rawFind for collection ' + this._name);
     logger.verbose('query = ' + JSON.stringify(query));
     logger.verbose('limit = ' + limit);
     // use these so the linter will not complain - until i actually use them properly
@@ -845,19 +835,18 @@ export default class OracleCollection {
     try {
       let findOperation;
 
-      await this.getCollectionConnection()
-        .then(conn => {
-          localConn = conn;
-          findOperation = this._oracleCollection.find();
-        })
-        .catch(async error => {
-          logger.error('Error getting connection in _rawFind, ERROR =' + error);
-          if (localConn) {
-            await localConn.close();
-            localConn = null;
-          }
-          throw error;
-        });
+      try {
+        const { conn, collection } = await this.getCollectionConnection();
+        localConn = conn;
+        findOperation = collection.find();
+      } catch (error) {
+        logger.error('Error getting connection in _rawFind, ERROR =' + error);
+        if (localConn) {
+          await localConn.close();
+          localConn = null;
+        }
+        throw error;
+      }
 
       //    let findOperation = this._oracleCollection.find(); // find() is sync and returns SodaOperation
 
@@ -1180,15 +1169,20 @@ export default class OracleCollection {
   //CDB 17-11 fix
 
   async distinct(field, query) {
-    //return this._oracleCollection.distinct(field, query);
-    const objects = await this._oracleCollection.find().filter(query).getDocuments();
-    const arr = [];
-    for (const obj in objects) {
-      const content = _.get(objects[obj].getContent(), field);
-      Array.isArray(content) ? arr.push(...content) : arr.push(content);
+    const { conn, collection } = await this.getCollectionConnection();
+    try {
+      const objects = await collection.find().filter(query).getDocuments();
+      const arr = [];
+      for (const obj in objects) {
+        const content = _.get(objects[obj].getContent(), field);
+        Array.isArray(content) ? arr.push(...content) : arr.push(content);
+      }
+      return [...new Set(arr)];
+    } finally {
+      if (conn) {
+        await conn.close();
+      }
     }
-    //let distinctObjects = [...new Set(arr)];
-    return [...new Set(arr)];
   }
   //CDB-END
 
@@ -1419,8 +1413,10 @@ export default class OracleCollection {
         // Update the document
         let localConn = null;
         try {
-          localConn = await this.getCollectionConnection();
-          const replaceResult = await this._oracleCollection
+          const handle = await this.getCollectionConnection();
+          localConn = handle.conn;
+          const collection = handle.collection;
+          const replaceResult = await collection
             .find()
             .key(key)
             .version(version)
@@ -1433,7 +1429,7 @@ export default class OracleCollection {
             logger.verbose('updateMany: Retrying update for key ' + key);
             const retryResult = await this._rawFind({ _id: oldContent._id }, { type: 'one' });
             if (retryResult && Object.keys(retryResult).length > 0) {
-              const retryReplaceResult = await this._oracleCollection
+              const retryReplaceResult = await collection
                 .find()
                 .key(retryResult.key)
                 .version(retryResult.version)
@@ -1463,11 +1459,10 @@ export default class OracleCollection {
     let localConn = null;
 
     return this.getCollectionConnection()
-      .then(conn => {
+      .then(({ conn, collection }) => {
         localConn = conn;
         localConn.execute(ddlTimeOut);
-        const result = this._oracleCollection.insertOne(object);
-        return result;
+        return collection.insertOne(object);
       })
       .finally(async () => {
         if (localConn) {
@@ -1486,9 +1481,9 @@ export default class OracleCollection {
 
     logger.verbose('entered drop for ' + this._name);
     return this.getCollectionConnection()
-      .then(conn => {
+      .then(({ conn, collection }) => {
         localConn = conn;
-        return this._oracleCollection.drop();
+        return collection.drop();
       })
       .then(result => {
         if (result) {
@@ -1517,9 +1512,9 @@ export default class OracleCollection {
     // for now, do it the old fashioned way with collection.find.remove
     let localConn = null;
     return this.getCollectionConnection()
-      .then(conn => {
+      .then(({ conn, collection }) => {
         localConn = conn;
-        return this._oracleCollection.find().remove();
+        return collection.find().remove();
       })
       .finally(async () => {
         if (localConn) {
@@ -1562,10 +1557,10 @@ export default class OracleCollection {
 
     logger.verbose('_createIndex index spec is ' + JSON.stringify(indexSpec));
     return await this.getCollectionConnection()
-      .then(async conn => {
+      .then(async ({ conn, collection }) => {
         localConn = conn;
         await localConn.execute(ddlTimeOut);
-        await this._oracleCollection.createIndex(indexSpec);
+        await collection.createIndex(indexSpec);
         return Promise.resolve;
       })
       .then(result => {
@@ -1640,9 +1635,9 @@ export default class OracleCollection {
     let localConn = null;
 
     const result = await this.getCollectionConnection()
-      .then(async conn => {
+      .then(async ({ conn, collection }) => {
         localConn = conn;
-        const result = await this._oracleCollection.dropIndex(indexName);
+        const result = await collection.dropIndex(indexName);
         return result;
       })
       .finally(async () => {
