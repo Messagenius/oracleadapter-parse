@@ -21,6 +21,7 @@ import {
 import { Pool } from 'oracledb';
 
 const oracledb = require('oracledb');
+const Aggregation = require('./Aggregation');
 const OracleSchemaCollectionName = '_SCHEMA';
 
 const storageAdapterAllCollections = oracleAdapter => {
@@ -509,6 +510,13 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
   }
   // getClass(className: string): Promise<StorageClass>;
+
+  // Generic, validated, database-side aggregation. Backend-neutral spec in,
+  // small aggregate rows out (raw documents are never materialized in Node).
+  // See ./Aggregation.js for the specification contract and safety guarantees.
+  async runAggregation(spec) {
+    return Aggregation.runAggregation(this, spec);
+  }
 
   // TODO: As yet not particularly well specified. Creates an object. Maybe shouldn't even need the schema,
   // and should infer from the type. Or maybe does need the schema for validations. Or maybe needs
