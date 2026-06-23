@@ -38,6 +38,37 @@ var initialized = false;
 var createConnPool = true;
 var schemaCollection = null;
 
+// Maximum attempts when the SODA optimistic version check loses to a
+// concurrent writer. The collection layer signals this by returning the
+// literal string 'retry'; we re-run the find+update with a tiny jittered
+// backoff. After exhausting attempts we throw, which surfaces the failure
+// to Parse Server instead of silently returning the 'retry' sentinel.
+const OPTIMISTIC_RETRY_MAX_ATTEMPTS = 5;
+const OPTIMISTIC_RETRY_BASE_MS = 5;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+const runWithOptimisticRetry = async (label, fn) => {
+  let attempt = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    attempt += 1;
+    const result = await fn();
+    if (result !== 'retry') {
+      return result;
+    }
+    if (attempt >= OPTIMISTIC_RETRY_MAX_ATTEMPTS) {
+      throw new Parse.Error(
+        Parse.Error.INTERNAL_SERVER_ERROR,
+        `${label} failed after ${attempt} optimistic-lock retries`
+      );
+    }
+    const jitter = Math.floor(Math.random() * OPTIMISTIC_RETRY_BASE_MS);
+    await sleep(OPTIMISTIC_RETRY_BASE_MS * attempt + jitter);
+    logger.verbose(`${label} optimistic-lock retry attempt ${attempt + 1}`);
+  }
+};
+
 const convertParseSchemaToOracleSchema = ({ ...schema }) => {
   delete schema.fields._rperm;
   delete schema.fields._wperm;
@@ -557,7 +588,10 @@ export class OracleStorageAdapter implements StorageAdapter {
       // Check if this query needs Oracle Storage Adapter _wperm syntax
       oraWhere = this.checkUserQuery(oraWhere);
       const collection = this._adaptiveCollection(className);
-      const result = await collection.findOneAndUpdate(oraWhere, oraUpdate, transactionalSession);
+      const result = await runWithOptimisticRetry(
+        `findOneAndUpdate(${className})`,
+        () => collection.findOneAndUpdate(oraWhere, oraUpdate, transactionalSession)
+      );
       logger.verbose('StorageAdapter findOneAndUpdate returns ' + JSON.stringify(result));
       return result;
     } catch (error) {
@@ -727,7 +761,10 @@ export class OracleStorageAdapter implements StorageAdapter {
       const oraWhere = transformWhere(className, query, schema);
       const oraUpdate = transformUpdate(className, update, schema);
       const collection = this._adaptiveCollection(className);
-      const result = await collection.upsertOne(oraWhere, oraUpdate, transactionalSession);
+      const result = await runWithOptimisticRetry(
+        `upsertOneObject(${className})`,
+        () => collection.upsertOne(oraWhere, oraUpdate, transactionalSession)
+      );
       logger.verbose('StorageAdapter upsertOneObject returns ' + result);
       return result;
     } catch (error) {
