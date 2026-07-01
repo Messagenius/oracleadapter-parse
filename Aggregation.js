@@ -178,6 +178,38 @@ const TS_FMT = `'YYYY-MM-DD"T"HH24:MI:SS.FF'`;
 // SQL clause builders
 // ---------------------------------------------------------------------------
 
+// Validate an optional IANA time zone (dateTrunc/datePart). Missing == UTC (the
+// historical behavior). Present-but-unknown is rejected. Uses Intl (the tz rule
+// source) so DST / historical rules are honored — never a numeric offset.
+function normalizeTimeZone(timeZone) {
+  if (timeZone == null || timeZone === '') return undefined;
+  if (typeof timeZone !== 'string') fail('timeZone must be an IANA string, e.g. "Europe/Rome"');
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone });
+  } catch (e) {
+    fail(`invalid IANA time zone: ${timeZone}`);
+  }
+  return timeZone;
+}
+
+// Safe SQL string literal for a validated zone (single quotes doubled; the zone
+// is Intl-validated so it can't legitimately contain quotes — defense in depth).
+function tzLiteral(timeZone) {
+  return `'${String(timeZone).replace(/'/g, "''")}'`;
+}
+
+// A Date-typed JSON scalar rendered in the client zone. The stored value is a UTC
+// TIMESTAMP; FROM_TZ(..,'UTC') AT TIME ZONE '<zone>' shifts it to the zone, then
+// CAST(.. AS TIMESTAMP) drops the offset so the value holds the LOCAL wall clock.
+// (Necessary because EXTRACT/TO_CHAR over a TIMESTAMP WITH TIME ZONE normalize the
+// time fields back to UTC — casting to a plain TIMESTAMP is what keeps local
+// day/hour buckets.) So TRUNC(day)/EXTRACT(hour) below bucket by what the client sees.
+function zonedDateExpr(resolved, timeZone) {
+  const utcTs = jsonScalar(resolved, 'date');
+  if (!timeZone) return utcTs;
+  return `CAST((FROM_TZ(${utcTs}, 'UTC') AT TIME ZONE ${tzLiteral(timeZone)}) AS TIMESTAMP)`;
+}
+
 function buildGroupExpr(g, ctx) {
   if (!g || typeof g !== 'object') fail('groupBy entry must be an object');
   if (!g.as || !SAFE_IDENT.test(g.as)) fail(`invalid groupBy alias: ${g.as}`);
@@ -185,13 +217,16 @@ function buildGroupExpr(g, ctx) {
   if (g.op === 'dateTrunc') {
     if (!DATE_UNITS.has(g.unit)) fail(`unsupported dateTrunc unit: ${g.unit}`);
     if (resolved.parseType !== 'Date') fail(`dateTrunc requires a Date field: ${g.field}`);
-    // 'day' -> YYYY-MM-DD text (UTC)
+    const tz = normalizeTimeZone(g.timeZone);
+    // 'day' -> YYYY-MM-DD text (UTC by default, else in the client zone)
+    if (tz) return `TO_CHAR(${zonedDateExpr(resolved, tz)}, 'YYYY-MM-DD')`;
     return `TO_CHAR(TRUNC(${jsonScalar(resolved, 'date')}), 'YYYY-MM-DD')`;
   }
   if (g.op === 'datePart') {
     if (!DATE_PARTS.has(g.part)) fail(`unsupported datePart: ${g.part}`);
     if (resolved.parseType !== 'Date') fail(`datePart requires a Date field: ${g.field}`);
-    return `EXTRACT(HOUR FROM ${jsonScalar(resolved, 'date')})`;
+    const tz = normalizeTimeZone(g.timeZone);
+    return `EXTRACT(HOUR FROM ${zonedDateExpr(resolved, tz)})`;
   }
   if (g.op) fail(`unsupported groupBy op: ${g.op}`);
   return jsonScalar(resolved, 'group');
