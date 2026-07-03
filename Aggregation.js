@@ -299,13 +299,27 @@ function comparison(resolved, cmp, value, binder) {
     return `${lhs} IN (${placeholders.join(', ')})`;
   }
 
+  let lhs, rhs;
   if (isDate) {
-    return `${jsonScalar(resolved, 'date')} ${sqlOp} ${dateBind(value, binder)}`;
+    lhs = jsonScalar(resolved, 'date');
+    rhs = dateBind(value, binder);
+  } else if (resolved.parseType === 'Number') {
+    lhs = jsonScalar(resolved, 'measureNumeric');
+    rhs = binder.add(Number(value));
+  } else {
+    lhs = jsonScalar(resolved, 'group');
+    rhs = binder.add(String(value));
   }
-  if (resolved.parseType === 'Number') {
-    return `${jsonScalar(resolved, 'measureNumeric')} ${sqlOp} ${binder.add(Number(value))}`;
+
+  // Mongo/SODA $ne semantics: an absent/NULL field counts as "not equal" and
+  // must match. Plain SQL `lhs != rhs` is UNKNOWN (row dropped) when lhs IS NULL,
+  // which diverges from the Parse find path (notEqualTo, which keeps NULL/absent).
+  // Include NULLs so the aggregation COUNT agrees with the list. E.g. a normal
+  // group has Conversation.isChannel absent and must still satisfy isChannel != true.
+  if (cmp === 'ne') {
+    return `(${lhs} IS NULL OR ${lhs} ${sqlOp} ${rhs})`;
   }
-  return `${jsonScalar(resolved, 'group')} ${sqlOp} ${binder.add(String(value))}`;
+  return `${lhs} ${sqlOp} ${rhs}`;
 }
 
 function scalarBindValue(resolved, v) {
