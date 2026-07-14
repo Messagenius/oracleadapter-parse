@@ -1044,33 +1044,25 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
 
   async count(className, schema, query, readPreference, hint) {
-    const skip = 0;
-    const limit = 0;
-    const sort = {};
-    let keys;
-    const caseInsensitive = false;
-    const explain = false;
+    // Count server-side in the database. The previous implementation fetched EVERY
+    // document of the class into memory and returned .length — on large classes this
+    // OOM-crashes the process (Parse Dashboard sends count=1 with every page request).
+    logger.verbose('StorageAdapter count for ' + className);
+    logger.verbose('make linter ignore ' + readPreference + hint);
     // See line 1183 in DatabaseController, it passes null in query
     if (query === null) {
       query = {};
     }
-    return this.find(className, schema, query, {
-      skip,
-      limit,
-      sort,
-      keys,
-      readPreference,
-      hint,
-      caseInsensitive,
-      explain,
-    })
-      .then(collection => {
-        return collection.length;
-      })
-      .catch(err => {
-        logger.error('in the catch block after collection.find for count()');
-        this.handleError(err);
-      });
+    try {
+      schema = convertParseSchemaToOracleSchema(schema);
+      let oracleWhere = transformWhere(className, query, schema);
+      oracleWhere = this.checkUserQuery(oracleWhere);
+      const collection = this._adaptiveCollection(className);
+      return await collection.count(oracleWhere);
+    } catch (err) {
+      logger.error('in the catch block of count()');
+      this.handleError(err);
+    }
   }
 
   //CDB Fix 18-11

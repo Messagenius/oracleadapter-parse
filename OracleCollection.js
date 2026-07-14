@@ -813,6 +813,13 @@ export default class OracleCollection {
     }
   }
 
+  // Server-side document count (SODA operation.count()); shares _rawFind's query
+  // normalization and connection handling. Note: count() cannot be combined with
+  // skip/limit/orderby, so no options are passed through.
+  async count(query) {
+    return this._rawFind(query, { type: 'count' }, {});
+  }
+
   async _rawFind(
     query,
     retval,
@@ -1112,6 +1119,26 @@ export default class OracleCollection {
       //   findOperation = findOperation.maxTimeMS(maxTimeMS);
       // }
 
+      // Server-side count: never materializes documents. Counting by fetching all docs
+      // (the previous behavior) loads the entire class into the Node heap and OOM-crashes
+      // the process on large classes (e.g. Parse Dashboard pagination sends count=1 on
+      // every page request).
+      if (retval.type === 'count') {
+        return findOperation
+          .count()
+          .then(result => result.count)
+          .finally(async () => {
+            if (localConn) {
+              await localConn.close();
+              localConn = null;
+            }
+          })
+          .catch(error => {
+            logger.error('Error running findOperation count, ERROR =' + error);
+            throw error;
+          });
+      }
+
       logger.verbose('findOperation = ' + JSON.stringify(findOperation));
       logger.verbose('about to getDocuments()');
       let localDocs;
@@ -1180,15 +1207,44 @@ export default class OracleCollection {
   //CDB 17-11 fix
 
   async distinct(field, query) {
-    //return this._oracleCollection.distinct(field, query);
-    const objects = await this._oracleCollection.find().filter(query).getDocuments();
-    const arr = [];
-    for (const obj in objects) {
-      const content = _.get(objects[obj].getContent(), field);
-      Array.isArray(content) ? arr.push(...content) : arr.push(content);
+    // Stream documents in bounded batches instead of materializing the whole class:
+    // fetching everything at once (the previous behavior) OOM-crashes the process on
+    // large classes. Only the distinct values are accumulated in memory.
+    const BATCH_SIZE = 500;
+    const values = new Set();
+    let localConn = null;
+    try {
+      localConn = await this.getCollectionConnection();
+      // Snapshot the handle: this._oracleCollection is re-bound (and its connection closed)
+      // by any concurrent operation on this collection — the loop must stay on OUR connection.
+      const collection = this._oracleCollection;
+      for (let skip = 0; ; skip += BATCH_SIZE) {
+        const docs = await collection
+          .find()
+          .filter(query)
+          .skip(skip)
+          .limit(BATCH_SIZE)
+          .getDocuments();
+        for (const doc of docs) {
+          const content = _.get(doc.getContent(), field);
+          if (Array.isArray(content)) {
+            content.forEach(value => values.add(value));
+          } else {
+            values.add(content);
+          }
+        }
+        if (docs.length < BATCH_SIZE) break;
+      }
+      return [...values];
+    } catch (error) {
+      logger.error('Error running distinct, ERROR =' + error);
+      throw error;
+    } finally {
+      if (localConn) {
+        await localConn.close();
+        localConn = null;
+      }
     }
-    //let distinctObjects = [...new Set(arr)];
-    return [...new Set(arr)];
   }
   //CDB-END
 
