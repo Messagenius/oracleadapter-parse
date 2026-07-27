@@ -1627,13 +1627,14 @@ export default class OracleCollection {
       .then(result => {
         // Parse expects _id index in Schema to be
         // _metadata: { indexes: { _id_: { _id: 1 }, name_1: { name: 1 } } }
-        const idx = { [indexSpec.fields[0].path]: 1 };
+        const idx = {};
+        indexSpec.fields.forEach(field => {
+          idx[field.path] = 1;
+        });
         if (indexSpec.fields[0].path === '_id') {
-          //          indexSpec.fields[0].path = '_id_';
           indexSpec.name = '_id_';
         }
-        //        const obj = { [indexSpec.fields[0].path]: [idx] };
-        const obj = { [indexSpec.name]: [idx] };
+        const obj = { [indexSpec.name]: idx };
         this.indexes.push(obj);
         return result;
       })
@@ -1658,12 +1659,14 @@ export default class OracleCollection {
           });
 
           if (typeof found === 'undefined') {
-            const idx = { [indexSpec.fields[0].path]: 1 };
+            const idx = {};
+            indexSpec.fields.forEach(field => {
+              idx[field.path] = 1;
+            });
             if (indexSpec.fields[0].path === '_id') {
               indexSpec.name = '_id_';
             }
-            //            const obj = { [indexSpec.fields[0].path]: [idx] };
-            const obj = { [indexSpec.name]: [idx] };
+            const obj = { [indexSpec.name]: idx };
             this.indexes.push(obj);
             return Promise.resolve;
           }
@@ -1675,20 +1678,82 @@ export default class OracleCollection {
       });
   }
 
-  getIndexes(className) {
-    logger.verbose('OracleCollection getIndexes className = ' + className);
-
-    // There is an odd case where _id is not added to schema document until server restart
-    // If _id_ does not exist in indexes array add it to returned array.
-    // It does exist on the actual Collection
-    const found = this.indexes.find(item => {
-      return Object.keys(item)[0] === '_id_';
-    });
-    if (typeof found === 'undefined') {
-      this.indexes.push({ _id_: { _id: 1 } });
+  // Extracts the JSON path from a function-based index expression, e.g.
+  //   JSON_VALUE("JSON_DOCUMENT" FORMAT OSON , '$."_p_conversation"' RETURNING ...)  -> _p_conversation
+  //   json_value("JSON_DOCUMENT",'$."a"."b"' returning ...)                          -> a.b
+  _jsonPathFromIndexExpression(expression) {
+    if (!expression) {
+      return null;
     }
-    logger.verbose('getIndexes returns ' + JSON.stringify(this.indexes));
-    return this.indexes;
+    const match = /'(\$[^']*)'/.exec(expression);
+    if (!match) {
+      return null;
+    }
+    const path = match[1].replace(/"/g, '').replace(/^\$\.?/, '');
+    return path.length > 0 ? path : null;
+  }
+
+  // Reads the collection's actual indexes from the data dictionary and returns
+  // them in the format Parse stores in _SCHEMA:  { indexName: { field: 1, ... } }
+  // The unique _id index (named 'ididx<collection>') is reported as '_id_'.
+  async getIndexes(className) {
+    logger.verbose('OracleCollection getIndexes className = ' + className);
+    let localConn = null;
+    try {
+      const pool = await this._oracleStorageAdapter.connect();
+      localConn = await pool.getConnection();
+      const result = await localConn.execute(
+        `SELECT i.index_name AS index_name,
+                e.column_expression AS column_expression,
+                e.column_position AS column_position
+           FROM user_indexes i
+           JOIN user_ind_expressions e
+             ON e.index_name = i.index_name
+            AND e.table_name = i.table_name
+          WHERE i.table_name = :tableName
+          ORDER BY i.index_name, e.column_position`,
+        { tableName: this._name },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const indexes = {};
+      for (const row of result.rows) {
+        const path = this._jsonPathFromIndexExpression(row.COLUMN_EXPRESSION);
+        if (!path) {
+          continue;
+        }
+        const name = row.INDEX_NAME === 'ididx' + this._name || path === '_id' ? '_id_' : row.INDEX_NAME;
+        if (!indexes[name]) {
+          indexes[name] = {};
+        }
+        // Mirror the datatype convention used on index creation: non-varchar2
+        // functional indexes are reported as their datatype string so a
+        // schema target like {createdAt: 'timestamp'} round-trips cleanly.
+        const returning = /RETURNING\s+(TIMESTAMP|NUMBER|DATE)/i.exec(row.COLUMN_EXPRESSION);
+        indexes[name][path] = returning ? returning[1].toLowerCase() : 1;
+      }
+      if (!indexes['_id_']) {
+        indexes['_id_'] = { _id: 1 };
+      }
+      logger.verbose('getIndexes returns ' + JSON.stringify(indexes));
+      return indexes;
+    } catch (error) {
+      logger.error('getIndexes dictionary lookup failed for ' + this._name + ': ' + error);
+      // Fall back to the legacy in-memory bookkeeping (only knows indexes
+      // created during this process lifetime), normalized to Parse format.
+      const legacy = { _id_: { _id: 1 } };
+      this.indexes.forEach(item => {
+        Object.keys(item).forEach(name => {
+          const spec = item[name];
+          legacy[name] = Array.isArray(spec) ? Object.assign({}, ...spec) : spec;
+        });
+      });
+      return legacy;
+    } finally {
+      if (localConn) {
+        await localConn.close();
+        localConn = null;
+      }
+    }
   }
 
   async dropIndex(indexName) {

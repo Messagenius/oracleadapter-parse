@@ -906,7 +906,10 @@ export class OracleStorageAdapter implements StorageAdapter {
     try {
       logger.verbose('StorageAdapter setIndexesFromOracle for ' + className);
       const indexes = await this.getIndexes(className);
-      const result = await this._schemaCollection().updateSchema(className, {
+      // updateSchemaIndexes replaces _metadata.indexes wholesale; the generic
+      // updateSchema path merges, which corrupts the record when the stored
+      // value is a legacy array (produces {"0": ..., "1": ...} keys).
+      const result = await this._schemaCollection().updateSchemaIndexes(className, {
         _metadata: { indexes: indexes },
       });
       logger.verbose('StorageAdapter setIndexesFromOracle returns ' + result);
@@ -1171,9 +1174,19 @@ export class OracleStorageAdapter implements StorageAdapter {
     var paths = Array();
 
     Object.keys(index).forEach(key => {
-      paths.push({
-        path: key,
-      });
+      const field = { path: key };
+      // Index spec values are normally 1/-1 (Mongo style). A string value of
+      // 'timestamp' | 'date' | 'number' | 'varchar2' selects the SODA index
+      // datatype. This matters for Date fields: queries compare them through
+      // a $timestamp cast, which a default (varchar2) functional index
+      // cannot serve — only a datatype:'timestamp' index matches.
+      if (
+        typeof index[key] === 'string' &&
+        ['timestamp', 'date', 'number', 'varchar2'].includes(index[key].toLowerCase())
+      ) {
+        field.datatype = index[key].toLowerCase();
+      }
+      paths.push(field);
     });
     return paths;
   }
@@ -1184,26 +1197,35 @@ export class OracleStorageAdapter implements StorageAdapter {
       var promises = Array();
       const collection = this._adaptiveCollection(className);
 
+      /*
+        2 index formats can be passed in
+        { key: { aString: 1 }, name: 'name1' }
+        { name1: { aString: 1 }, name2: { anotherString: 1 }, ... }
+        Handle them both. The map format can carry SEVERAL indexes in one
+        object (createClass passes all of a new class's indexes that way);
+        previously only the first key was processed and the rest were
+        silently dropped.
+      */
+      const indexList = [];
       for (let idx = 0; idx < indexes.length; idx++) {
         const index = indexes[idx];
-
-        let idxName = Object.keys(index)[0];
-        let paths;
-        /*
-          2 index formats can be passed in
-          { key: { aString: 1 }, name: 'name1' }
-          { name1: { aString: 1 } }
-          Handle them both
-        */
-        if (idxName === 'key') {
-          paths = index[idxName];
-          idxName = index['name'];
+        if (Object.prototype.hasOwnProperty.call(index, 'key') && index.name) {
+          indexList.push({ name: index.name, paths: index.key });
         } else {
-          paths = index[idxName];
+          Object.keys(index).forEach(idxName => {
+            // _id_ is created automatically as ididx<collection> when the
+            // collection is created; skip it here to avoid a name clash.
+            if (idxName === '_id_') {
+              return;
+            }
+            indexList.push({ name: idxName, paths: index[idxName] });
+          });
         }
+      }
 
+      for (const { name, paths } of indexList) {
         const indexRequest = {
-          name: idxName,
+          name: name,
           fields: this.createIndexPaths(paths),
         };
         const promise = await collection._createIndex(indexRequest);
@@ -1224,8 +1246,8 @@ export class OracleStorageAdapter implements StorageAdapter {
         'StorageAdapter getIndexes for ' + className + '   Connection = ' + connection
       );
       const collection = this._adaptiveCollection(className);
-      const result = collection.getIndexes(className);
-      logger.verbose('StorageAdapter getIndexes returns ' + result);
+      const result = await collection.getIndexes(className);
+      logger.verbose('StorageAdapter getIndexes returns ' + JSON.stringify(result));
       return result;
     } catch (error) {
       logger.error('StorageAdapter getIndexes throws for className ' + className);
@@ -1279,12 +1301,16 @@ export class OracleStorageAdapter implements StorageAdapter {
           delete existingIndexes[name];
         } else {
           Object.keys(field).forEach(key => {
-            if (
-              !Object.prototype.hasOwnProperty.call(
-                fields,
-                key.indexOf('_p_') === 0 ? key.replace('_p_', '') : key
-              )
-            ) {
+            const parseKey = key.indexOf('_p_') === 0 ? key.replace('_p_', '') : key;
+            // Built-in columns exist on every object but parse-server omits
+            // them from the fields it passes for system classes (_User & co:
+            // defaultColumns[className] replaces _Default instead of merging
+            // with it), so always accept them.
+            const builtinFields = ['_id', 'objectId', 'createdAt', 'updatedAt', 'ACL'];
+            if (builtinFields.includes(parseKey)) {
+              return;
+            }
+            if (!Object.prototype.hasOwnProperty.call(fields, parseKey)) {
               throw new Parse.Error(
                 Parse.Error.INVALID_QUERY,
                 `Field ${key} does not exist, cannot add index.`
