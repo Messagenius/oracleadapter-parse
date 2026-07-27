@@ -451,27 +451,38 @@ function clampLimit(limit) {
 // ---------------------------------------------------------------------------
 
 async function resolveTables(adapter, classNames) {
-  const oracledb = require('oracledb');
-  await adapter.connect();
-  const pool = oracledb.getPool('parse');
-  const conn = await pool.getConnection();
-  try {
-    const soda = conn.getSodaDatabase();
-    const out = {};
-    for (const className of classNames) {
-      if (!SAFE_IDENT.test(className)) fail(`invalid className: ${className}`);
-      const coll = await soda.openCollection(className);
-      if (!coll) fail(`collection does not exist: ${className}`);
-      const meta = coll.metaData || {};
-      out[className] = {
-        tableName: meta.tableName || className,
-        contentColumn: (meta.contentColumn && meta.contentColumn.name) || 'JSON_DOCUMENT',
-      };
+  // A collection's backing table name never changes for the life of the
+  // process, so resolve each class once per adapter. Without this cache every
+  // aggregation call paid an extra pool connection + one SODA openCollection
+  // round trip per class just to re-learn the same table names.
+  const cache = adapter.__aggTableCache || (adapter.__aggTableCache = new Map());
+  const missing = [...new Set(classNames)].filter(c => !cache.has(c));
+
+  if (missing.length) {
+    const oracledb = require('oracledb');
+    await adapter.connect();
+    const pool = oracledb.getPool('parse');
+    const conn = await pool.getConnection();
+    try {
+      const soda = conn.getSodaDatabase();
+      for (const className of missing) {
+        if (!SAFE_IDENT.test(className)) fail(`invalid className: ${className}`);
+        const coll = await soda.openCollection(className);
+        if (!coll) fail(`collection does not exist: ${className}`);
+        const meta = coll.metaData || {};
+        cache.set(className, {
+          tableName: meta.tableName || className,
+          contentColumn: (meta.contentColumn && meta.contentColumn.name) || 'JSON_DOCUMENT',
+        });
+      }
+    } finally {
+      await conn.close();
     }
-    return out;
-  } finally {
-    await conn.close();
   }
+
+  const out = {};
+  for (const className of classNames) out[className] = cache.get(className);
+  return out;
 }
 
 async function runAggregation(adapter, spec) {
