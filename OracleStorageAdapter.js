@@ -322,6 +322,14 @@ export class OracleStorageAdapter implements StorageAdapter {
       poolTimeout: intEnv('PARSE_ORACLE_POOL_TIMEOUT', 10),
       queueTimeout: intEnv('PARSE_ORACLE_QUEUE_TIMEOUT', 60000),
       enableStatistics: boolEnv('PARSE_ORACLE_ENABLE_STATISTICS', true),
+      // Cache SODA collection metadata in the pool. Without this every
+      // openCollection() (one per adapter operation) round-trips
+      // DBMS_SODA_ADMIN.DESCRIBE_COLLECTION — AWR showed 16.7M calls under
+      // load. Collection metadata never changes at runtime, so this is safe.
+      sodaMetaDataCache: boolEnv('PARSE_ORACLE_SODA_MD_CACHE', true),
+      // Larger client statement cache reduces parse pressure
+      // (library cache: mutex X) under high concurrency. Driver default: 30.
+      stmtCacheSize: intEnv('PARSE_ORACLE_STMT_CACHE', 100),
     };
 
     logger.info('creating a connection pool with options: ' + JSON.stringify(poolOptions));
@@ -1255,8 +1263,69 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
   }
 
+  // Parse relation join collections (_Join:relation:Class) are not Parse
+  // classes, so schema-driven index creation never covers them — historically
+  // they only had the _id index and every relation query full-scanned.
+  // Ensure owningId/relatedId functional indexes exist on all of them.
+  // Runs once per boot from updateSchemaWithIndexes; idempotent.
+  async ensureJoinCollectionIndexes() {
+    let conn = null;
+    try {
+      const pool = await this.connect();
+      conn = await pool.getConnection();
+      const tables = await conn.execute(
+        `SELECT table_name FROM user_tables WHERE table_name LIKE '\\_Join:%' ESCAPE '\\'`,
+        {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      if (tables.rows.length === 0) {
+        return;
+      }
+      const idxRows = await conn.execute(
+        `SELECT index_name FROM user_indexes WHERE table_name LIKE '\\_Join:%' ESCAPE '\\'`,
+        {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const existing = new Set(idxRows.rows.map(r => r.INDEX_NAME));
+      const soda = conn.getSodaDatabase();
+      for (const row of tables.rows) {
+        const name = row.TABLE_NAME;
+        const collection = await soda.openCollection(name);
+        if (!collection) {
+          continue;
+        }
+        for (const [prefix, path] of [
+          ['ownidx', 'owningId'],
+          ['relidx', 'relatedId'],
+        ]) {
+          if (existing.has(prefix + name)) {
+            continue;
+          }
+          try {
+            await collection.createIndex({ name: prefix + name, fields: [{ path: path }] });
+            logger.info('ensureJoinCollectionIndexes created ' + prefix + name);
+          } catch (error) {
+            if (error.errorNum !== 40733) {
+              logger.error(
+                'ensureJoinCollectionIndexes failed for ' + prefix + name + ': ' + error
+              );
+            }
+          }
+        }
+      }
+    } catch (error) {
+      // Never fail boot over join-index maintenance.
+      logger.error('ensureJoinCollectionIndexes: ' + error);
+    } finally {
+      if (conn) {
+        await conn.close();
+      }
+    }
+  }
+
   updateSchemaWithIndexes() {
-    return this.getAllClasses()
+    return this.ensureJoinCollectionIndexes()
+      .then(() => this.getAllClasses())
       .then(classes => {
         const promises = classes.map(schema => {
           return this.setIndexesFromOracle(schema.className);
@@ -1347,9 +1416,53 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
   }
 
-  // createTransactionalSession(): Promise<any>;
-  // commitTransactionalSession(transactionalSession: any): Promise<void>;
-  // abortTransactionalSession(transactionalSession: any): Promise<void>;
+  /*
+    Transactional sessions (parse-server REST batch {"transaction": true}).
+
+    A session is { conn, collections } — one dedicated pool connection with
+    the global oracledb.autoCommit=false, plus a cache of SODA collection
+    handles opened on that connection (populated lazily by
+    OracleCollection._writeContext). Writes that receive the session run on
+    that connection and skip their own commit; the whole batch commits or
+    rolls back here. Closing an uncommitted connection rolls back, so the
+    abort path is safe even after partial failures.
+  */
+  async createTransactionalSession(): Promise<any> {
+    const pool = await this.connect();
+    const conn = await pool.getConnection();
+    logger.verbose('createTransactionalSession opened connection');
+    return { conn: conn, collections: {} };
+  }
+
+  async commitTransactionalSession(transactionalSession: any): Promise<void> {
+    try {
+      await transactionalSession.conn.commit();
+      logger.verbose('commitTransactionalSession committed');
+    } finally {
+      try {
+        await transactionalSession.conn.close();
+      } catch (error) {
+        logger.error('commitTransactionalSession close error: ' + error);
+      }
+      transactionalSession.conn = null;
+      transactionalSession.collections = {};
+    }
+  }
+
+  async abortTransactionalSession(transactionalSession: any): Promise<void> {
+    try {
+      await transactionalSession.conn.rollback();
+      logger.verbose('abortTransactionalSession rolled back');
+    } finally {
+      try {
+        await transactionalSession.conn.close();
+      } catch (error) {
+        logger.error('abortTransactionalSession close error: ' + error);
+      }
+      transactionalSession.conn = null;
+      transactionalSession.collections = {};
+    }
+  }
 
   async dropIndex(className: string, index: any) {
     try {

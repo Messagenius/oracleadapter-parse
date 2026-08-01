@@ -6,7 +6,13 @@ import _ from 'lodash';
 import OracleStorageAdapter from './OracleStorageAdapter';
 
 const oracledb = require('oracledb');
-oracledb.autoCommit = true;
+// SODA operations honor only this GLOBAL flag (no per-call override), so
+// batching several writes into one transaction requires it to be false and
+// every write path to commit explicitly. AWR showed 2.48M single-row commits
+// under load with the old `autoCommit = true`. Write paths below either
+// commit their own connection or defer to the enclosing transactional
+// session (parse-server batch {"transaction": true}).
+oracledb.autoCommit = false;
 const Collection = oracledb.SodaCollection;
 const SodaDB = oracledb.SodaDB;
 
@@ -96,6 +102,26 @@ export default class OracleCollection {
               this.indexes.push({ _id_: { _id: 1 } });
             }
           }
+
+          // Relation join collections are queried by owningId/relatedId but
+          // are invisible to schema-driven index creation — index them here.
+          if (this._name.startsWith('_Join:')) {
+            for (const [prefix, path] of [
+              ['ownidx', 'owningId'],
+              ['relidx', 'relatedId'],
+            ]) {
+              try {
+                await newCollection.createIndex({
+                  name: prefix + this._name,
+                  fields: [{ path: path }],
+                });
+              } catch (error) {
+                if (error.errorNum !== 40733) {
+                  throw error;
+                }
+              }
+            }
+          }
           return newCollection;
         }
         return coll;
@@ -111,6 +137,66 @@ export default class OracleCollection {
         this._oracleCollection
     );
     return localConn;
+  }
+
+  /*
+    Write-context helpers.
+
+    With the global oracledb.autoCommit = false, every write path must either
+    commit its own pool connection or run on the connection of an enclosing
+    transactional session (created by OracleStorageAdapter.
+    createTransactionalSession) and let the session owner commit/rollback.
+
+    A context is { conn, collection, transactional }:
+    - transactional=false: conn came from the pool via getCollectionConnection,
+      caller must _commitWrite() on success and _closeWriteContext() always.
+    - transactional=true: conn/collection belong to the session; commit,
+      rollback and close are the session owner's job — both helpers no-op.
+  */
+  async _writeContext(transactionalSession) {
+    if (transactionalSession && transactionalSession.conn) {
+      if (!transactionalSession.collections) {
+        transactionalSession.collections = {};
+      }
+      let collection = transactionalSession.collections[this._name];
+      if (!collection) {
+        collection = await transactionalSession.conn.getSodaDatabase().openCollection(this._name);
+        if (!collection) {
+          // Collection does not exist yet: create it through the normal path
+          // (DDL commits independently of the transaction), then open it on
+          // the session connection.
+          const conn = await this.getCollectionConnection();
+          await conn.close();
+          collection = await transactionalSession.conn
+            .getSodaDatabase()
+            .openCollection(this._name);
+        }
+        transactionalSession.collections[this._name] = collection;
+      }
+      return { conn: transactionalSession.conn, collection: collection, transactional: true };
+    }
+    const conn = await this.getCollectionConnection();
+    // Snapshot the handle: this._oracleCollection is re-bound by concurrent
+    // getCollectionConnection calls (see distinct()), never read it after
+    // an await.
+    return { conn: conn, collection: this._oracleCollection, transactional: false };
+  }
+
+  async _commitWrite(ctx) {
+    if (!ctx.transactional) {
+      await ctx.conn.commit();
+    }
+  }
+
+  async _closeWriteContext(ctx) {
+    if (!ctx.transactional && ctx.conn) {
+      try {
+        await ctx.conn.close();
+      } catch (error) {
+        logger.error('error closing write connection: ' + error);
+      }
+      ctx.conn = null;
+    }
   }
 
   // Atomically updates data in the database for a single (first) object that matched the query
@@ -135,7 +221,7 @@ export default class OracleCollection {
     let promise;
 
     try {
-      promise = await this.findOneAndUpdate(query, update, null);
+      promise = await this.findOneAndUpdate(query, update, session);
       logger.verbose('Upsert Promise = ' + promise);
       if (promise === false) {
         logger.verbose('Upsert Insert for query ' + JSON.stringify(query));
@@ -143,7 +229,7 @@ export default class OracleCollection {
         if (docs && docs.length == 0) {
           // Its an insert so merge query into update
           _.merge(update, query);
-          promise = await this.insertOne(update);
+          promise = await this.insertOne(update, session);
         }
       }
       return promise;
@@ -366,29 +452,24 @@ export default class OracleCollection {
           }
         }
         logger.verbose('Updated Object = ' + JSON.stringify(updateObj));
-        let localConn = null;
-        return this.getCollectionConnection()
-          .then(conn => {
-            localConn = conn;
-            return this._oracleCollection.find().key(key).version(version).replaceOne(updateObj);
-          })
-          .then(result => {
-            if (result.replaced == true) {
-              return updateObj;
-            } else {
-              return 'retry';
-            }
-          })
-          .finally(async () => {
-            if (localConn) {
-              await localConn.close();
-              localConn = null;
-            }
-          })
-          .catch(error => {
-            logger.error('Find One and Update replaceOne ERROR = ', error);
-            throw error;
-          });
+        const ctx = await this._writeContext(transactionalSession);
+        try {
+          const replaceResult = await ctx.collection
+            .find()
+            .key(key)
+            .version(version)
+            .replaceOne(updateObj);
+          if (replaceResult.replaced == true) {
+            await this._commitWrite(ctx);
+            return updateObj;
+          }
+          return 'retry';
+        } catch (error) {
+          logger.error('Find One and Update replaceOne ERROR = ', error);
+          throw error;
+        } finally {
+          await this._closeWriteContext(ctx);
+        }
       } else {
         logger.verbose('No Docs, nothing to update, return false');
         return false;
@@ -441,29 +522,24 @@ export default class OracleCollection {
       const updateObj = oldContent;
       logger.verbose('Updated Object = ' + JSON.stringify(updateObj));
 
-      let localConn = null;
-      return this.getCollectionConnection()
-        .then(conn => {
-          localConn = conn;
-          return this._oracleCollection.find().key(key).version(version).replaceOne(updateObj);
-        })
-        .then(result => {
-          if (result.replaced == true) {
-            return update;
-          } else {
-            return 'retry';
-          }
-        })
-        .finally(async () => {
-          if (localConn) {
-            await localConn.close();
-            localConn = null;
-          }
-        })
-        .catch(error => {
-          logger.error('updateSchemaIndexes update ERROR: ', error);
-          throw error;
-        });
+      const ctx = await this._writeContext(null);
+      try {
+        const replaceResult = await ctx.collection
+          .find()
+          .key(key)
+          .version(version)
+          .replaceOne(updateObj);
+        if (replaceResult.replaced == true) {
+          await this._commitWrite(ctx);
+          return update;
+        }
+        return 'retry';
+      } catch (error) {
+        logger.error('updateSchemaIndexes update ERROR: ', error);
+        throw error;
+      } finally {
+        await this._closeWriteContext(ctx);
+      }
     } else {
       logger.verbose('updateSchemaIndexes No record found for query: ' + JSON.stringify(query));
       return false;
@@ -489,22 +565,17 @@ export default class OracleCollection {
         const version = result.version;
         logger.verbose('version = ' + version);
 
-        let localConn = null;
-        return this.getCollectionConnection()
-          .then(conn => {
-            localConn = conn;
-            return this._oracleCollection.find().key(key).version(version).remove();
-          })
-          .finally(async () => {
-            if (localConn) {
-              await localConn.close();
-              localConn = null;
-            }
-          })
-          .catch(error => {
-            logger.error('Find One and Delete remove ERROR: ', error);
-            throw error;
-          });
+        const ctx = await this._writeContext(null);
+        try {
+          const removeResult = await ctx.collection.find().key(key).version(version).remove();
+          await this._commitWrite(ctx);
+          return removeResult;
+        } catch (error) {
+          logger.error('Find One and Delete remove ERROR: ', error);
+          throw error;
+        } finally {
+          await this._closeWriteContext(ctx);
+        }
       } else {
         logger.verbose('Find One and Delete No record found for query: ' + JSON.stringify(query));
       }
@@ -526,28 +597,30 @@ export default class OracleCollection {
       });
 
       if (result.length > 0) {
-        for (let i = 0; i < result.length; i++) {
-          // found the doc, so we need to update it
-          const key = result[i].key;
-          logger.verbose('key = ' + key);
-          const version = result[i].version;
-          logger.verbose('version = ' + version);
-          let localConn = null;
-          return this.getCollectionConnection()
-            .then(conn => {
-              localConn = conn;
-              return this._oracleCollection.find().key(key).version(version).remove();
-            })
-            .finally(async () => {
-              if (localConn) {
-                await localConn.close();
-                localConn = null;
-              }
-            })
-            .catch(error => {
-              logger.error('Delete Objects By Query remove ERROR: ', error);
-              throw error;
-            });
+        // One connection, one commit for the whole matched set. The previous
+        // code returned from inside the loop and silently deleted only the
+        // FIRST matching document (with a commit per row on top).
+        const ctx = await this._writeContext(transactionalSession);
+        try {
+          let removed = 0;
+          for (let i = 0; i < result.length; i++) {
+            const key = result[i].key;
+            const version = result[i].version;
+            const removeResult = await ctx.collection
+              .find()
+              .key(key)
+              .version(version)
+              .remove();
+            removed += removeResult.count;
+          }
+          await this._commitWrite(ctx);
+          logger.verbose('deleteObjectsByQuery removed ' + removed + ' of ' + result.length);
+          return removed;
+        } catch (error) {
+          logger.error('Delete Objects By Query remove ERROR: ', error);
+          throw error;
+        } finally {
+          await this._closeWriteContext(ctx);
         }
       } else {
         throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
@@ -649,29 +722,20 @@ export default class OracleCollection {
     delete oldContent[fieldName];
     logger.verbose('oldContent after delete update = ' + JSON.stringify(oldContent));
 
-    let localConn = null;
-    return this.getCollectionConnection()
-      .then(conn => {
-        localConn = conn;
-        return this._oracleCollection.find().key(key).version(version).replaceOne(oldContent);
-      })
-      .then(result => {
-        if (result.replaced == true) {
-          return oldContent;
-        } else {
-          return 'retry';
-        }
-      })
-      .finally(async () => {
-        if (localConn) {
-          await localConn.close();
-          localConn = null;
-        }
-      })
-      .catch(error => {
-        logger.error('DeleteFieldFromCollection replaceOne ERROR: ', error);
-        throw error;
-      });
+    const ctx = await this._writeContext(null);
+    try {
+      const result = await ctx.collection.find().key(key).version(version).replaceOne(oldContent);
+      if (result.replaced == true) {
+        await this._commitWrite(ctx);
+        return oldContent;
+      }
+      return 'retry';
+    } catch (error) {
+      logger.error('DeleteFieldFromCollection replaceOne ERROR: ', error);
+      throw error;
+    } finally {
+      await this._closeWriteContext(ctx);
+    }
   }
 
   //  Delete a field in a specific SCHEMA doc
@@ -696,29 +760,24 @@ export default class OracleCollection {
         delete oldContent[fieldName];
         logger.verbose('oldContent after delete update = ' + JSON.stringify(oldContent));
 
-        let localConn = null;
-        return this.getCollectionConnection()
-          .then(conn => {
-            localConn = conn;
-            return this._oracleCollection.find().key(key).version(version).replaceOne(oldContent);
-          })
-          .then(result => {
-            if (result.replaced == true) {
-              return oldContent;
-            } else {
-              return 'retry';
-            }
-          })
-          .finally(async () => {
-            if (localConn) {
-              await localConn.close();
-              localConn = null;
-            }
-          })
-          .catch(error => {
-            logger.error('Delete SCHEMA Field replaceOne ERROR: ', error.message);
-            throw error;
-          });
+        const ctx = await this._writeContext(null);
+        try {
+          const replaceResult = await ctx.collection
+            .find()
+            .key(key)
+            .version(version)
+            .replaceOne(oldContent);
+          if (replaceResult.replaced == true) {
+            await this._commitWrite(ctx);
+            return oldContent;
+          }
+          return 'retry';
+        } catch (error) {
+          logger.error('Delete SCHEMA Field replaceOne ERROR: ', error.message);
+          throw error;
+        } finally {
+          await this._closeWriteContext(ctx);
+        }
       } else {
         logger.verbose('Field ' + fieldName + ' Not Found In DeleteSchemaField');
         return false;
@@ -1284,6 +1343,10 @@ export default class OracleCollection {
 
       const updatedDocs = [];
 
+      // One connection and ONE commit for the whole matched set (previously:
+      // connection acquire + commit per document).
+      const ctx = await this._writeContext(transactionalSession);
+      try {
       // Process each document
       for (let i = 0; i < results.length; i++) {
         const result = results[i];
@@ -1473,68 +1536,58 @@ export default class OracleCollection {
         }
 
         // Update the document
-        let localConn = null;
-        try {
-          localConn = await this.getCollectionConnection();
-          const replaceResult = await this._oracleCollection
-            .find()
-            .key(key)
-            .version(version)
-            .replaceOne(updateObj);
+        const replaceResult = await ctx.collection
+          .find()
+          .key(key)
+          .version(version)
+          .replaceOne(updateObj);
 
-          if (replaceResult.replaced === true) {
-            updatedDocs.push(updateObj);
-          } else {
-            // Retry once if version mismatch
-            logger.verbose('updateMany: Retrying update for key ' + key);
-            const retryResult = await this._rawFind({ _id: oldContent._id }, { type: 'one' });
-            if (retryResult && Object.keys(retryResult).length > 0) {
-              const retryReplaceResult = await this._oracleCollection
-                .find()
-                .key(retryResult.key)
-                .version(retryResult.version)
-                .replaceOne(updateObj);
-              if (retryReplaceResult.replaced === true) {
-                updatedDocs.push(updateObj);
-              }
+        if (replaceResult.replaced === true) {
+          updatedDocs.push(updateObj);
+        } else {
+          // Retry once if version mismatch
+          logger.verbose('updateMany: Retrying update for key ' + key);
+          const retryResult = await this._rawFind({ _id: oldContent._id }, { type: 'one' });
+          if (retryResult && Object.keys(retryResult).length > 0) {
+            const retryReplaceResult = await ctx.collection
+              .find()
+              .key(retryResult.key)
+              .version(retryResult.version)
+              .replaceOne(updateObj);
+            if (retryReplaceResult.replaced === true) {
+              updatedDocs.push(updateObj);
             }
-          }
-        } finally {
-          if (localConn) {
-            await localConn.close();
-            localConn = null;
           }
         }
       }
 
+      await this._commitWrite(ctx);
       logger.verbose('updateMany: Successfully updated ' + updatedDocs.length + ' documents');
       return updatedDocs;
+      } finally {
+        await this._closeWriteContext(ctx);
+      }
     } catch (error) {
       logger.error('Collection updateMany ERROR: ', error);
       throw error;
     }
   }
 
-  async insertOne(object) {
-    let localConn = null;
-
-    return this.getCollectionConnection()
-      .then(conn => {
-        localConn = conn;
-        localConn.execute(ddlTimeOut);
-        const result = this._oracleCollection.insertOne(object);
-        return result;
-      })
-      .finally(async () => {
-        if (localConn) {
-          await localConn.close();
-          localConn = null;
-        }
-      })
-      .catch(error => {
-        logger.error('error during insertOne = ' + error);
-        throw error;
-      });
+  async insertOne(object, transactionalSession) {
+    // Note: the previous version ran an ALTER SESSION ddl_lock_timeout PL/SQL
+    // block before every insert — that is only needed for DDL (createIndex),
+    // not DML, and cost one extra round trip per row.
+    const ctx = await this._writeContext(transactionalSession);
+    try {
+      const result = await ctx.collection.insertOne(object);
+      await this._commitWrite(ctx);
+      return result;
+    } catch (error) {
+      logger.error('error during insertOne = ' + error);
+      throw error;
+    } finally {
+      await this._closeWriteContext(ctx);
+    }
   }
 
   async drop() {
@@ -1573,9 +1626,11 @@ export default class OracleCollection {
     // for now, do it the old fashioned way with collection.find.remove
     let localConn = null;
     return this.getCollectionConnection()
-      .then(conn => {
+      .then(async conn => {
         localConn = conn;
-        return this._oracleCollection.find().remove();
+        const result = await this._oracleCollection.find().remove();
+        await localConn.commit();
+        return result;
       })
       .finally(async () => {
         if (localConn) {
