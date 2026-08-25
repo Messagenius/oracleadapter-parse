@@ -12,7 +12,15 @@ const oracledb = require('oracledb');
 // under load with the old `autoCommit = true`. Write paths below either
 // commit their own connection or defer to the enclosing transactional
 // session (parse-server batch {"transaction": true}).
-oracledb.autoCommit = false;
+//
+// PARSE_ORACLE_AUTOCOMMIT=true restores the pre-6.8.0 behavior: every SODA
+// DML commits with the statement, so a write can never outlive its request
+// and no row lock can survive an idle session. It costs the commit batching
+// (and with it the atomicity of transactional sessions -- set
+// MSG_DB_TRANSACTIONS=false alongside it, never one without the other), but
+// leaves every other pool optimization in place. Kept as an operational
+// escape hatch for deployments that hit lock contention.
+oracledb.autoCommit = process.env.PARSE_ORACLE_AUTOCOMMIT === 'true';
 const Collection = oracledb.SodaCollection;
 const SodaDB = oracledb.SodaDB;
 
