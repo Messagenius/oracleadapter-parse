@@ -1377,9 +1377,11 @@ export default class OracleCollection {
     let localConn = null;
     try {
       localConn = await this.getCollectionConnection();
-      // Snapshot the handle: this._oracleCollection is re-bound (and its connection closed)
-      // by any concurrent operation on this collection — the loop must stay on OUR connection.
-      const collection = this._oracleCollection;
+      // Open on OUR connection: this._oracleCollection is re-bound (and its
+      // connection closed) by any concurrent operation on this collection, so
+      // reading it here can hand back another request's handle. The loop must
+      // stay on the connection we hold.
+      const collection = await localConn.getSodaDatabase().openCollection(this._name);
       for (let skip = 0; ; skip += BATCH_SIZE) {
         const docs = await collection
           .find()
@@ -1707,9 +1709,11 @@ export default class OracleCollection {
 
     logger.verbose('entered drop for ' + this._name);
     return this.getCollectionConnection()
-      .then(conn => {
+      .then(async conn => {
         localConn = conn;
-        return this._oracleCollection.drop();
+        // Open on OUR connection, not the shared this._oracleCollection handle.
+        const collection = await conn.getSodaDatabase().openCollection(this._name);
+        return collection ? collection.drop() : { dropped: false };
       })
       .then(result => {
         if (result) {
@@ -1740,7 +1744,15 @@ export default class OracleCollection {
     return this.getCollectionConnection()
       .then(async conn => {
         localConn = conn;
-        const result = await this._oracleCollection.find().remove();
+        // Open on OUR connection. Using the shared handle here was the worst
+        // case of the whole class: this is a bulk DELETE, so the removal could
+        // run on one session while the commit below ran on another, leaving
+        // every row of the collection locked by an uncommitted transaction.
+        const collection = await conn.getSodaDatabase().openCollection(this._name);
+        if (!collection) {
+          return { count: 0 };
+        }
+        const result = await collection.find().remove();
         await localConn.commit();
         return result;
       })
@@ -1788,7 +1800,13 @@ export default class OracleCollection {
       .then(async conn => {
         localConn = conn;
         await localConn.execute(ddlTimeOut);
-        await this._oracleCollection.createIndex(indexSpec);
+        // Open on OUR connection: ddl_lock_timeout was just set on this
+        // session, so the DDL has to run here to be governed by it.
+        const collection = await conn.getSodaDatabase().openCollection(this._name);
+        if (!collection) {
+          throw new Error('could not open collection ' + this._name + ' to create index');
+        }
+        await collection.createIndex(indexSpec);
         return Promise.resolve;
       })
       .then(result => {
@@ -1930,7 +1948,12 @@ export default class OracleCollection {
     const result = await this.getCollectionConnection()
       .then(async conn => {
         localConn = conn;
-        const result = await this._oracleCollection.dropIndex(indexName);
+        // Open on OUR connection, not the shared this._oracleCollection handle.
+        const collection = await conn.getSodaDatabase().openCollection(this._name);
+        if (!collection) {
+          throw new Error('could not open collection ' + this._name + ' to drop index');
+        }
+        const result = await collection.dropIndex(indexName);
         return result;
       })
       .finally(async () => {
