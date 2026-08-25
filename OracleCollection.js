@@ -893,26 +893,43 @@ export default class OracleCollection {
       // TODO:  MUST FIX
       var index = {};
       index[key] = '2d';
-      await this.getCollectionConnection();
 
-      const result = await this._oracleCollection
-        .createIndex(index)
-        // Retry, but just once.
-        .then(() =>
-          this._rawFind(query, {
-            skip,
-            limit,
-            sort,
-            keys,
-            maxTimeMS,
-            readPreference,
-            hint,
-            caseInsensitive,
-            explain,
-          })
-        );
-      this.closeConnection();
-      return result.map(i => i.getContent());
+      // Create the geo index on a connection we actually hold and release it
+      // before retrying. Previously this discarded the connection returned by
+      // getCollectionConnection (leaking the session) and then called
+      // this.closeConnection(), which is not a method on this class and threw
+      // a TypeError.
+      const conn = await this.getCollectionConnection();
+      try {
+        const collection = await conn.getSodaDatabase().openCollection(this._name);
+        if (!collection) {
+          throw new Error('could not open collection ' + this._name + ' to create geo index');
+        }
+        await collection.createIndex(index);
+      } finally {
+        await conn.close();
+      }
+
+      // Retry, but just once. _rawFind's second parameter is the return-type
+      // selector, not the options bag -- passing the options there left
+      // retval.type undefined, so _rawFind resolved to undefined and the
+      // caller's .map() threw. Mirror the primary path above exactly.
+      return await this._rawFind(
+        query,
+        { type: 'content' },
+        {
+          skip,
+          limit,
+          sort,
+          keys,
+          maxTimeMS,
+          readPreference,
+          hint,
+          caseInsensitive,
+          explain,
+          sortTypes,
+        }
+      );
     }
   }
 
