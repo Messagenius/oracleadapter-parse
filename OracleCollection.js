@@ -176,10 +176,25 @@ export default class OracleCollection {
       return { conn: transactionalSession.conn, collection: collection, transactional: true };
     }
     const conn = await this.getCollectionConnection();
-    // Snapshot the handle: this._oracleCollection is re-bound by concurrent
-    // getCollectionConnection calls (see distinct()), never read it after
-    // an await.
-    return { conn: conn, collection: this._oracleCollection, transactional: false };
+    // Open the collection on OUR connection rather than reading
+    // this._oracleCollection. That field lives on a process-wide cached
+    // OracleCollection (see OracleStorageAdapter._adaptiveCollection) and is
+    // re-bound by every concurrent getCollectionConnection call, so reading it
+    // here can hand back a handle bound to another request's session. The
+    // replaceOne then runs on that session while _commitWrite/_closeWriteContext
+    // act on this one -- with oracledb.autoCommit = false that strands an
+    // uncommitted row lock on a connection nobody will commit. The
+    // transactional branch above already opens on its own connection; do the
+    // same here. sodaMetaDataCache makes this a local lookup, not a round trip.
+    const collection = await conn.getSodaDatabase().openCollection(this._name);
+    if (!collection) {
+      // getCollectionConnection creates the collection when missing (DDL, which
+      // commits independently), so this should be unreachable. Fail loudly
+      // rather than returning a context with a null collection.
+      await conn.close();
+      throw new Error('could not open collection ' + this._name + ' on its own connection');
+    }
+    return { conn: conn, collection: collection, transactional: false };
   }
 
   async _commitWrite(ctx) {
@@ -912,9 +927,17 @@ export default class OracleCollection {
       let findOperation;
 
       await this.getCollectionConnection()
-        .then(conn => {
+        .then(async conn => {
           localConn = conn;
-          findOperation = this._oracleCollection.find();
+          // Same reason as _writeContext: this._oracleCollection is shared
+          // mutable state re-bound by concurrent callers, so a find() built
+          // from it can execute on another request's connection -- returning
+          // that request's results, or failing if it already closed.
+          const collection = await conn.getSodaDatabase().openCollection(this._name);
+          if (!collection) {
+            throw new Error('could not open collection ' + this._name + ' on its own connection');
+          }
+          findOperation = collection.find();
         })
         .catch(async error => {
           logger.error('Error getting connection in _rawFind, ERROR =' + error);
