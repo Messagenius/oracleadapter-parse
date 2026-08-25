@@ -565,6 +565,28 @@ export class OracleStorageAdapter implements StorageAdapter {
     }
   }
 
+  /*
+    OracleCollection's write paths signal a SODA optimistic-concurrency
+    conflict (the row's VERSION changed between the read and the replaceOne)
+    by resolving to the string 'retry'. That sentinel must never reach
+    parse-server, which would take the string itself as the updated object and
+    hand it back to the client. Retry once, then surface a real Parse error.
+  */
+  async _resolveRetry(className, operation) {
+    let result = await operation();
+    if (result === 'retry') {
+      logger.verbose('_resolveRetry retrying conflicted write on ' + className);
+      result = await operation();
+    }
+    if (result === 'retry') {
+      throw new Parse.Error(
+        Parse.Error.OBJECT_NOT_FOUND,
+        'Concurrent update conflict on ' + className
+      );
+    }
+    return result;
+  }
+
   async findOneAndUpdate(className, schema, query, update, transactionalSession) {
     try {
       logger.verbose('StorageAdapter findOneAndUpdate for ' + className);
@@ -573,7 +595,10 @@ export class OracleStorageAdapter implements StorageAdapter {
       // Check if this query needs Oracle Storage Adapter _wperm syntax
       oraWhere = this.checkUserQuery(oraWhere);
       const collection = this._adaptiveCollection(className);
-      const result = await collection.findOneAndUpdate(oraWhere, oraUpdate, transactionalSession);
+      const result = await this._resolveRetry(
+        className,
+        () => collection.findOneAndUpdate(oraWhere, oraUpdate, transactionalSession)
+      );
       logger.verbose('StorageAdapter findOneAndUpdate returns ' + JSON.stringify(result));
       return result;
     } catch (error) {
@@ -743,7 +768,9 @@ export class OracleStorageAdapter implements StorageAdapter {
       const oraWhere = transformWhere(className, query, schema);
       const oraUpdate = transformUpdate(className, update, schema);
       const collection = this._adaptiveCollection(className);
-      const result = await collection.upsertOne(oraWhere, oraUpdate, transactionalSession);
+      const result = await this._resolveRetry(className, () =>
+        collection.upsertOne(oraWhere, oraUpdate, transactionalSession)
+      );
       logger.verbose('StorageAdapter upsertOneObject returns ' + result);
       return result;
     } catch (error) {
