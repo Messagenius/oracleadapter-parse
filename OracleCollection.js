@@ -140,8 +140,22 @@ export default class OracleCollection {
         }
         return coll;
       })
-      .catch(error => {
+      .catch(async error => {
         logger.error('getCollectionConnection ERROR:  ' + error);
+        // Release the pool connection before propagating. Without this any
+        // failure after getConnection() -- openCollection, createCollection,
+        // createIndex, a DDL lock timeout -- leaks the session for the life of
+        // the process: it is checked out of the pool with nobody holding a
+        // reference to close it, and with autoCommit = false it keeps any
+        // transaction (and its row locks) open indefinitely.
+        if (localConn) {
+          try {
+            await localConn.close();
+          } catch (closeError) {
+            logger.error('getCollectionConnection close error: ' + closeError);
+          }
+          localConn = null;
+        }
         throw error;
       });
     logger.verbose(
