@@ -1568,14 +1568,23 @@ export default class OracleCollection {
         if (replaceResult.replaced === true) {
           updatedDocs.push(updateObj);
         } else {
-          // Retry once if version mismatch
+          // Retry once if version mismatch.
+          // Re-read on OUR connection: _rawFind would take a SECOND connection
+          // from the pool while this one still holds uncommitted DML. Under
+          // load every request ends up holding one connection and waiting for
+          // another that can never come, so the pool deadlocks until
+          // queueTimeout fires (NJS-040) -- and the row locks are held for that
+          // whole wait.
           logger.verbose('updateMany: Retrying update for key ' + key);
-          const retryResult = await this._rawFind({ _id: oldContent._id }, { type: 'one' });
-          if (retryResult && Object.keys(retryResult).length > 0) {
+          const retryDocs = await ctx.collection
+            .find()
+            .filter({ _id: oldContent._id })
+            .getDocuments();
+          if (retryDocs && retryDocs.length === 1) {
             const retryReplaceResult = await ctx.collection
               .find()
-              .key(retryResult.key)
-              .version(retryResult.version)
+              .key(retryDocs[0].key)
+              .version(retryDocs[0].version)
               .replaceOne(updateObj);
             if (retryReplaceResult.replaced === true) {
               updatedDocs.push(updateObj);
