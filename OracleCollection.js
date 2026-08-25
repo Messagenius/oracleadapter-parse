@@ -1048,6 +1048,32 @@ export default class OracleCollection {
           }
           //CDB-END
 
+          // SODA QBE mis-generates the JSON path when $exists shares a field
+          // with another operator. {f: {$ne: v, $exists: true}} -- which is
+          // exactly what Parse produces for notEqualTo(f, v) + exists(f) --
+          // becomes
+          //   exists(@.f?((!(@ == $B0)) && (exists(@@))))
+          // and the `@@` is not valid path syntax, so Oracle raises ORA-40597
+          // / JZN-00229 and the whole query fails.
+          //
+          // Split the $exists into its own conjunct so each operator gets its
+          // own predicate. The other fields of the query are preserved (unlike
+          // the null rewrites above, which replace it wholesale).
+          if (json != null && !Array.isArray(json) && !x.startsWith('$')) {
+            const ops = Object.keys(json);
+            if (ops.length > 1 && ops.includes('$exists')) {
+              const rest = Object.assign({}, json);
+              delete rest['$exists'];
+              const split = [{ [x]: { $exists: json['$exists'] } }, { [x]: rest }];
+              const newQuery = Object.assign({}, query);
+              delete newQuery[x];
+              newQuery['$and'] = Array.isArray(newQuery['$and'])
+                ? newQuery['$and'].concat(split)
+                : split;
+              query = newQuery;
+            }
+          }
+
           //CDD
           // Remove empty objects from $and clause
           // ORA-40676: invalid Query-By-Example (QBE) filter specification
