@@ -44,7 +44,14 @@ export default class OracleCollection {
     }
   }
 
-  async getCollectionConnection() {
+  /*
+    Create the collection (and the indexes Mongo would have created
+    implicitly) on the given SodaDatabase. Takes the SodaDatabase explicitly
+    so the caller decides which connection the DDL runs on -- SODA DDL commits
+    independently of any surrounding transaction, so it is safe to run on a
+    transactional session's own connection.
+  */
+  async _createCollection(sodadb) {
     const mymetadata = {
       keyColumn: { name: 'ID', assignmentMethod: 'UUID' },
       contentColumn: { name: 'JSON_DOCUMENT', sqlType: this.jsonSQLtype },
@@ -53,8 +60,59 @@ export default class OracleCollection {
       creationTimeColumn: { name: 'CREATED_ON' },
     };
 
+    logger.verbose('_createCollection create NEW collection for  ' + this._name);
+    const newCollection = await sodadb.createCollection(this._name, {
+      metaData: mymetadata,
+    });
+
+    /*
+      Create index on _id for every new collection
+      This imitates Mongo behavior which happens automatically
+
+      Index names MUST be unique in a schema, append table name
+      cannot have two indexes with the same name in a single schema.
+    */
+    if (!this.idIndexCreating) {
+      this.idIndexCreating = true;
+      const indexName = 'ididx' + this._name;
+      const indexSpec = { name: indexName, unique: true, fields: [{ path: '_id' }] };
+      await newCollection.createIndex(indexSpec);
+      logger.verbose('_createCollection successfully create _id index for  ' + this._name);
+      // Add _id if it doesn't exist to indexes array
+      const found = this.indexes.find(item => {
+        return Object.keys(item)[0] === '_id_';
+      });
+      if (typeof found === 'undefined') {
+        this.indexes.push({ _id_: { _id: 1 } });
+      }
+    }
+
+    // Relation join collections are queried by owningId/relatedId but
+    // are invisible to schema-driven index creation — index them here.
+    if (this._name.startsWith('_Join:')) {
+      for (const [prefix, path] of [
+        ['ownidx', 'owningId'],
+        ['relidx', 'relatedId'],
+      ]) {
+        try {
+          await newCollection.createIndex({
+            name: prefix + this._name,
+            fields: [{ path: path }],
+          });
+        } catch (error) {
+          if (error.errorNum !== 40733) {
+            throw error;
+          }
+        }
+      }
+    }
+    return newCollection;
+  }
+
+  async getCollectionConnection() {
     logger.verbose('getCollectionConnection about to connect for collection ' + this._name);
     let localConn;
+    let localSodaDB;
     this._oracleCollection = await this._oracleStorageAdapter
       .connect()
       .then(p => {
@@ -69,60 +127,16 @@ export default class OracleCollection {
       })
       .then(sodadb => {
         logger.verbose('getCollectionConnection open collection for  ' + this._name);
+        // Keep the SodaDatabase in a local: this._oracleSodaDB is shared
+        // mutable state and a concurrent call may re-bind it to another
+        // connection before the next .then() runs.
+        localSodaDB = sodadb;
         this._oracleSodaDB = sodadb;
         return sodadb.openCollection(this._name);
       })
       .then(async coll => {
         if (!coll) {
-          logger.verbose('getCollectionConnection create NEW collection for  ' + this._name);
-          const newCollection = await this._oracleSodaDB.createCollection(this._name, {
-            metaData: mymetadata,
-          });
-
-          /*
-            Create index on _id for every new collection
-            This imitates Mongo behavior which happens automatically
-
-            Index names MUST be unique in a schema, append table name
-            cannot have two indexes with the same name in a single schema.
-          */
-          if (!this.idIndexCreating) {
-            this.idIndexCreating = true;
-            const indexName = 'ididx' + this._name;
-            const indexSpec = { name: indexName, unique: true, fields: [{ path: '_id' }] };
-            await newCollection.createIndex(indexSpec);
-            logger.verbose(
-              'getCollectionConnection successfully create _id index for  ' + this._name
-            );
-            // Add _id if it doesn't exist to indexes array
-            const found = this.indexes.find(item => {
-              return Object.keys(item)[0] === '_id_';
-            });
-            if (typeof found === 'undefined') {
-              this.indexes.push({ _id_: { _id: 1 } });
-            }
-          }
-
-          // Relation join collections are queried by owningId/relatedId but
-          // are invisible to schema-driven index creation — index them here.
-          if (this._name.startsWith('_Join:')) {
-            for (const [prefix, path] of [
-              ['ownidx', 'owningId'],
-              ['relidx', 'relatedId'],
-            ]) {
-              try {
-                await newCollection.createIndex({
-                  name: prefix + this._name,
-                  fields: [{ path: path }],
-                });
-              } catch (error) {
-                if (error.errorNum !== 40733) {
-                  throw error;
-                }
-              }
-            }
-          }
-          return newCollection;
+          return this._createCollection(localSodaDB);
         }
         return coll;
       })
@@ -162,14 +176,15 @@ export default class OracleCollection {
       if (!collection) {
         collection = await transactionalSession.conn.getSodaDatabase().openCollection(this._name);
         if (!collection) {
-          // Collection does not exist yet: create it through the normal path
-          // (DDL commits independently of the transaction), then open it on
-          // the session connection.
-          const conn = await this.getCollectionConnection();
-          await conn.close();
-          collection = await transactionalSession.conn
-            .getSodaDatabase()
-            .openCollection(this._name);
+          // Collection does not exist yet. Create it on the session's OWN
+          // connection: going through getCollectionConnection would take a
+          // second connection from the pool while this session already holds
+          // one (with locks), which is the same pool self-deadlock updateMany
+          // used to have. SODA DDL commits independently of the surrounding
+          // transaction, so creating it here does not affect the batch.
+          collection = await this._createCollection(
+            transactionalSession.conn.getSodaDatabase()
+          );
         }
         transactionalSession.collections[this._name] = collection;
       }
