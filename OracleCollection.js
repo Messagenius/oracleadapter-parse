@@ -4,6 +4,7 @@ import Parse from 'parse/node';
 import logger from '../../../logger.js';
 import _ from 'lodash';
 import OracleStorageAdapter from './OracleStorageAdapter';
+import { mapWithConcurrency, poolConcurrencyLimit } from './PoolConcurrency';
 
 const oracledb = require('oracledb');
 // SODA operations honor only this GLOBAL flag (no per-call override), so
@@ -690,29 +691,29 @@ export default class OracleCollection {
   // the matched row, never sweep the whole collection.
   async deleteFields(fieldNames: Array<string>) {
     try {
-      var promises = Array();
       // Rewriting like createIndexes, Collection method will just delete a field
       logger.verbose(
         'DeleteFields ' + JSON.stringify(fieldNames) + ' for Collection ' + this._name
       );
-      for (let idx = 0; idx < fieldNames.length; idx++) {
-        const fieldName = fieldNames[idx];
-        logger.verbose('about to delete field' + fieldName);
-        const promise = this.deleteFieldFromCollection(fieldName)
-          .then(promise => {
+      // Bounded fan-out: each field drop walks every matching document and
+      // every one of those takes its own pool connection.
+      const results = await mapWithConcurrency(
+        fieldNames,
+        poolConcurrencyLimit(this._oracleStorageAdapter),
+        async fieldName => {
+          logger.verbose('about to delete field' + fieldName);
+          try {
+            const promise = await this.deleteFieldFromCollection(fieldName);
             if (promise === 'retry') {
-              return this.deleteFieldFromCollection(fieldName);
+              return await this.deleteFieldFromCollection(fieldName);
             }
             return promise;
-          })
-          .catch(error => {
+          } catch (error) {
             logger.error('Collection deleteFields caught error ' + error.message);
             throw error;
-          });
-        promises.push(promise);
-      }
-
-      const results = await Promise.all(promises);
+          }
+        }
+      );
       logger.verbose('DeleteFields returns ' + results);
       return results;
     } catch (error) {
@@ -731,29 +732,31 @@ export default class OracleCollection {
       });
 
       if (result.length > 0) {
-        // found the doc, so we need to update it
-        var promises = Array();
-        for (let i = 0; i < result.length; i++) {
-          const promise = this.deleteField(
-            fieldName,
-            result[i].key,
-            result[i].version,
-            result[i].content
-          )
-            .then(promise => {
+        // found the doc, so we need to update it.
+        // Bounded fan-out: deleteField takes one pool connection per document,
+        // so an unbounded Promise.all over a large class asks the pool for
+        // hundreds of connections at once and the tail fails with NJS-040.
+        const results = await mapWithConcurrency(
+          result,
+          poolConcurrencyLimit(this._oracleStorageAdapter),
+          async doc => {
+            try {
+              const promise = await this.deleteField(
+                fieldName,
+                doc.key,
+                doc.version,
+                doc.content
+              );
               if (promise === 'retry') {
-                return this.deleteFieldFromCollection(fieldName);
+                return await this.deleteFieldFromCollection(fieldName);
               }
               return promise;
-            })
-            .catch(error => {
+            } catch (error) {
               logger.error('deleteFieldFromConnection caught error ' + error.message);
               throw error;
-            });
-          promises.push(promise);
-        }
-
-        const results = await Promise.all(promises);
+            }
+          }
+        );
         logger.verbose('DeleteFieldFromCollection returns ' + results);
         return results;
       } else {

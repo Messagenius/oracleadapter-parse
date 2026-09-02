@@ -2,6 +2,7 @@
 // Licensed under the Universal Permissive License v 1.0 as shown at https://oss.oracle.com/licenses/upl/
 import logger from '../../../logger.js';
 import OracleCollection from './OracleCollection';
+import { mapWithConcurrency, poolConcurrencyLimit } from './PoolConcurrency';
 import Parse from 'parse/node';
 
 function _objectWithoutProperties(source, excluded) {
@@ -262,33 +263,34 @@ class OracleSchemaCollection {
 
   // Find and delete Schema Fields
   async deleteSchemaFields(className: string, fieldNames: Array<string>) {
-    var promises = Array();
     // Rewriting like createIndexes, Collection method will just delete a field
     logger.verbose(
       'DeleteSchema Fields ' + JSON.stringify(fieldNames) + ' for Schema ' + className
     );
-    for (let idx = 0; idx < fieldNames.length; idx++) {
-      const fieldName = fieldNames[idx];
-      logger.verbose('about to delete field ' + fieldName);
-      const promise = this._collection
-        .deleteSchemaField(_oracleSchemaQueryFromNameQuery(className), fieldName)
-        .then(promise => {
+    // Bounded: deleteSchemaField takes a pool connection per field.
+    const results = await mapWithConcurrency(
+      fieldNames,
+      poolConcurrencyLimit(this._collection && this._collection._oracleStorageAdapter),
+      async fieldName => {
+        logger.verbose('about to delete field ' + fieldName);
+        try {
+          const promise = await this._collection.deleteSchemaField(
+            _oracleSchemaQueryFromNameQuery(className),
+            fieldName
+          );
           if (promise === 'retry') {
-            return this._collection.deleteSchemaField(
+            return await this._collection.deleteSchemaField(
               _oracleSchemaQueryFromNameQuery(className),
               fieldName
             );
           }
           return promise;
-        })
-        .catch(error => {
+        } catch (error) {
           logger.error('SchemaCollection deleteSchemaFields caught error ' + error.message);
           throw error;
-        });
-      promises.push(promise);
-    }
-
-    const results = await Promise.all(promises);
+        }
+      }
+    );
     logger.verbose('DeleteSchemaFields returns ' + results);
     return results;
   }

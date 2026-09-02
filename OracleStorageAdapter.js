@@ -2,6 +2,7 @@
 // Licensed under the Universal Permissive License v 1.0 as shown at https://oss.oracle.com/licenses/upl/
 import OracleSchemaCollection from './OracleSchemaCollection';
 import OracleCollection from './OracleCollection';
+import { mapWithConcurrency, poolConcurrencyLimit } from './PoolConcurrency';
 import { StorageAdapter } from '../StorageAdapter';
 import type { SchemaType, StorageClass, QueryType, QueryOptions } from '../StorageAdapter';
 // @flow-disable-next
@@ -481,8 +482,9 @@ export class OracleStorageAdapter implements StorageAdapter {
     //    let result;
     logger.verbose('entering deleteAllClasses fast = ' + fast);
     const collections = storageAdapterAllCollections(this);
-    return Promise.all(
-      collections.map(collection => (fast ? this._truncate(collection) : this._drop(collection)))
+    // Bounded: _truncate/_drop each take a pool connection.
+    return mapWithConcurrency(collections, poolConcurrencyLimit(this), collection =>
+      fast ? this._truncate(collection) : this._drop(collection)
     );
   }
 
@@ -1353,12 +1355,16 @@ export class OracleStorageAdapter implements StorageAdapter {
   updateSchemaWithIndexes() {
     return this.ensureJoinCollectionIndexes()
       .then(() => this.getAllClasses())
-      .then(classes => {
-        const promises = classes.map(schema => {
-          return this.setIndexesFromOracle(schema.className);
-        });
-        return Promise.all(promises);
-      })
+      .then(classes =>
+        // Runs at boot for every class, and each class costs three sequential
+        // pool connections (getIndexes, then the read and the write inside
+        // updateSchemaIndexes). Fanning out over all of them at once asks the
+        // pool for far more than poolMax and times the tail out with NJS-040
+        // before the pod has served its first request.
+        mapWithConcurrency(classes, poolConcurrencyLimit(this), schema =>
+          this.setIndexesFromOracle(schema.className)
+        )
+      )
       .catch(err => this.handleError(err));
   }
 
