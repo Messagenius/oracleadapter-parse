@@ -278,7 +278,9 @@ export default class OracleCollection {
       logger.verbose('Upsert Promise = ' + promise);
       if (promise === false) {
         logger.verbose('Upsert Insert for query ' + JSON.stringify(query));
-        promise = await this._rawFind(query, { type: 'sodadocs' }).then(d => (docs = d));
+        promise = await this._rawFind(query, { type: 'sodadocs' }, {}, session).then(
+          d => (docs = d)
+        );
         if (docs && docs.length == 0) {
           // Its an insert so merge query into update
           _.merge(update, query);
@@ -304,9 +306,11 @@ export default class OracleCollection {
 
       let updateObj;
 
-      let result = await this._rawFind(query, { type: 'one' }).then(result => {
-        return result;
-      });
+      let result = await this._rawFind(query, { type: 'one' }, {}, transactionalSession).then(
+        result => {
+          return result;
+        }
+      );
       //************************************************************************************************/
       // Modify Update based on Mongo operators
       //
@@ -645,9 +649,11 @@ export default class OracleCollection {
         'use transactionalSession to make linter happy ' + JSON.stringify(transactionalSession)
       );
 
-      const result = await this._rawFind(query, { type: 'all' }).then(result => {
-        return result;
-      });
+      const result = await this._rawFind(query, { type: 'all' }, {}, transactionalSession).then(
+        result => {
+          return result;
+        }
+      );
 
       if (result.length > 0) {
         // One connection, one commit for the whole matched set. The previous
@@ -965,7 +971,8 @@ export default class OracleCollection {
       caseInsensitive,
       explain,
       sortTypes,
-    } = {}
+    } = {},
+    transactionalSession
   ) {
     logger.verbose('_rawFind: collection = ' + JSON.stringify(this._oracleCollection));
     logger.verbose('query = ' + JSON.stringify(query));
@@ -983,27 +990,42 @@ export default class OracleCollection {
     try {
       let findOperation;
 
-      await this.getCollectionConnection()
-        .then(async conn => {
-          localConn = conn;
-          // Same reason as _writeContext: this._oracleCollection is shared
-          // mutable state re-bound by concurrent callers, so a find() built
-          // from it can execute on another request's connection -- returning
-          // that request's results, or failing if it already closed.
-          const collection = await conn.getSodaDatabase().openCollection(this._name);
-          if (!collection) {
-            throw new Error('could not open collection ' + this._name + ' on its own connection');
-          }
-          findOperation = collection.find();
-        })
-        .catch(async error => {
-          logger.error('Error getting connection in _rawFind, ERROR =' + error);
-          if (localConn) {
-            await localConn.close();
-            localConn = null;
-          }
-          throw error;
-        });
+      if (transactionalSession && transactionalSession.conn) {
+        // Read on the transaction's own connection. Two reasons: taking a
+        // second pool connection while the session already holds one (and its
+        // row locks) is the nested acquire that deadlocks the pool, and a read
+        // on a different session cannot see the transaction's own uncommitted
+        // writes -- so a batch touching the same object twice reads stale
+        // content and then fails the version check on replaceOne.
+        // localConn stays null: the session owns commit, rollback and close,
+        // so every close below is skipped by its `if (localConn)` guard.
+        const ctx = await this._writeContext(transactionalSession);
+        findOperation = ctx.collection.find();
+      } else {
+        await this.getCollectionConnection()
+          .then(async conn => {
+            localConn = conn;
+            // Same reason as _writeContext: this._oracleCollection is shared
+            // mutable state re-bound by concurrent callers, so a find() built
+            // from it can execute on another request's connection -- returning
+            // that request's results, or failing if it already closed.
+            const collection = await conn.getSodaDatabase().openCollection(this._name);
+            if (!collection) {
+              throw new Error(
+                'could not open collection ' + this._name + ' on its own connection'
+              );
+            }
+            findOperation = collection.find();
+          })
+          .catch(async error => {
+            logger.error('Error getting connection in _rawFind, ERROR =' + error);
+            if (localConn) {
+              await localConn.close();
+              localConn = null;
+            }
+            throw error;
+          });
+      }
 
       //    let findOperation = this._oracleCollection.find(); // find() is sync and returns SodaOperation
 
@@ -1438,9 +1460,11 @@ export default class OracleCollection {
       );
 
       // Find all matching documents
-      const results = await this._rawFind(query, { type: 'all' }).then(result => {
-        return result;
-      });
+      const results = await this._rawFind(query, { type: 'all' }, {}, transactionalSession).then(
+        result => {
+          return result;
+        }
+      );
 
       if (!results || results.length === 0) {
         logger.verbose('updateMany: No documents found matching query');
