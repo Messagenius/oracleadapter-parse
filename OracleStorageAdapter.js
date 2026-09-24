@@ -291,7 +291,7 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     this.initialize();
 
-    var re = new RegExp('oracledb://[a-zA-Z0-9_]*:[^@:]*@[a-zA-Z0-9_.:/]*$');
+    var re = new RegExp('oracledb://[a-zA-Z0-9_]*:[^@:]*@[a-zA-Z0-9_.:/-]*$');
 
     if (!re.test(this._uri)) {
       throw 'Incorrect Connection String Format.  Format is oracledb://user:password@tnsname';
