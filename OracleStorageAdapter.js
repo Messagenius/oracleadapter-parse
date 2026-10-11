@@ -332,6 +332,26 @@ export class OracleStorageAdapter implements StorageAdapter {
       // (library cache: mutex X) under high concurrency. Driver default: 30.
       stmtCacheSize: intEnv('PARSE_ORACLE_STMT_CACHE', 100),
     };
+    // Dead-connection protection, opt-in so the defaults stay unchanged.
+    // expireTime (minutes): Thick-mode TCP keepalive probes, keeps idle sessions alive through
+    // firewalls/NAT and lets the client notice a dropped one. poolPingInterval (seconds): a
+    // connection idle longer than this is pinged before the pool hands it out (driver default 60,
+    // -1 disables, 0 pings on every checkout).
+    if (process.env.PARSE_ORACLE_EXPIRE_TIME) {
+      poolOptions.expireTime = intEnv('PARSE_ORACLE_EXPIRE_TIME', 0);
+    }
+    if (process.env.PARSE_ORACLE_POOL_PING_INTERVAL) {
+      poolOptions.poolPingInterval = intEnv('PARSE_ORACLE_POOL_PING_INTERVAL', 60);
+    }
+    // poolPingTimeout (ms): how long the pre-checkout ping may wait on a dead connection
+    // before the pool drops it and opens a new one (driver default 5000).
+    if (process.env.PARSE_ORACLE_POOL_PING_TIMEOUT) {
+      poolOptions.poolPingTimeout = intEnv('PARSE_ORACLE_POOL_PING_TIMEOUT', 5000);
+    }
+    // callTimeout (ms, opt-in): per round-trip limit applied to every connection handed out by
+    // the pool. A call that does not return (dead peer, row lock wait) is cancelled instead of
+    // holding its connection and thread forever. Do not set it for long DDL/index builds (init).
+    const callTimeoutMs = intEnv('PARSE_ORACLE_CALL_TIMEOUT', 0);
 
     logger.info('creating a connection pool with options: ' + JSON.stringify(poolOptions));
     try {
@@ -346,6 +366,16 @@ export class OracleStorageAdapter implements StorageAdapter {
         });
         logger.info('connection pool successfully created');
         this._connectionPool = oracledb.getPool('parse');
+        if (callTimeoutMs > 0) {
+          const pool = this._connectionPool;
+          const getConnection = pool.getConnection.bind(pool);
+          pool.getConnection = async (...args) => {
+            const conn = await getConnection(...args);
+            conn.callTimeout = callTimeoutMs;
+            return conn;
+          };
+          logger.info('callTimeout enabled: ' + callTimeoutMs + ' ms');
+        }
         return Promise.resolve(this._connectionPool);
       } else {
         logger.verbose('Returning connection promise while connecting');
