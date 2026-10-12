@@ -290,6 +290,25 @@ function transformConstraint(constraint, field, count = false) {
         const opts =
           typeof constraint['$options'] === 'string' ? constraint['$options'] : '';
         const wildcard = opts.indexOf('m') !== -1 ? '((.|\n)*)' : '.*';
+
+        // Array fields only: a case-sensitive literal prefix (Query.startsWith ->
+        // ^\Qtext\E, or a plain ^text) becomes $startsWith. Oracle plans `starts
+        // with` as an INDEX RANGE SCAN on a multivalue index (each element is
+        // tested), while an anchored regex is evaluated row by row. String fields
+        // keep the regex path, as in upstream.
+        if (inArray && constraint['$options'] === undefined) {
+          let prefix = null;
+          const quoted = /^\^\\Q([\s\S]*)\\E$/.exec(s);
+          if (quoted) {
+            if (quoted[1].indexOf('\\E') === -1) prefix = quoted[1];
+          } else if (/^\^[\p{L}\p{N}_ -]+$/u.test(s)) {
+            prefix = s.substring(1);
+          }
+          if (prefix) {
+            answer['$startsWith'] = prefix;
+            break;
+          }
+        }
         //CDB-END
 
         //CDB
